@@ -13,8 +13,13 @@ import MLXNN
 ///
 /// When a JANG model is detected (via `jangConfig`), per-layer bit widths are
 /// inferred from tensor shapes automatically. Standard MLX models are unaffected.
+/// This is typically called via ``GenericModelFactory/load(from:using:configuration:useLatest:progressHandler:)``.
+/// This function loads all `safetensor` files in the given `modelDirectory`,
+/// calls ``BaseLanguageModel/sanitize(weights:metadata:)`` to allow per-model preprocessing,
+/// applies optional quantization, and
+/// updates the model with the weights.
 public func loadWeights(
-    modelDirectory: URL, model: LanguageModel,
+    modelDirectory: URL, model: BaseLanguageModel,
     quantization: BaseConfiguration.Quantization? = nil,
     perLayerQuantization: BaseConfiguration.PerLayerQuantization? = nil,
     jangConfig: JangConfig? = nil

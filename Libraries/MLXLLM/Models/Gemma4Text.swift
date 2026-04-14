@@ -454,8 +454,61 @@ class Gemma4Experts: Module {
 
         let expertOut = switchGLU(xFlat, indicesFlat)
 
-        let weightsFlat = expandedDimensions(weights.reshaped(B * S, K), axis: -1)
-        return (expertOut * weightsFlat).sum(axis: -2).reshaped(B, S, H)
+        if let (sharedK, sharedV) = sharedKV {
+            // KV-shared layers use pre-computed KV from an earlier layer
+            keys = sharedK
+            values = sharedV
+            currentOffset = offset ?? 0
+        } else {
+            var k = kProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
+            k = kNorm(k)
+            k = k.transposed(0, 2, 1, 3)
+
+            currentOffset = cache?.offset ?? 0
+            k = rope(k, offset: currentOffset)
+
+            var v: MLXArray
+            if let vProj {
+                v = vProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
+            } else {
+                v = k
+            }
+            v = vNorm(v)
+            v = v.transposed(0, 2, 1, 3)
+
+            if let cache {
+                let (updatedK, updatedV) = cache.update(keys: k, values: v)
+                keys = updatedK
+                values = updatedV
+            } else {
+                keys = k
+                values = v
+            }
+        }
+
+        queries = queries.transposed(0, 2, 1, 3)
+        queries = rope(queries, offset: currentOffset)
+
+        // Adjust mask if cache size differs from mask size
+        var adjustedMask = mask
+        if case .array(let maskArray) = mask {
+            let keysSeqLen = keys.dim(2)
+            if maskArray.dim(-1) != keysSeqLen {
+                adjustedMask = .array(maskArray[.ellipsis, 0 ..< keysSeqLen])
+            }
+        }
+
+        let output = MLXFast.scaledDotProductAttention(
+            queries: queries,
+            keys: keys,
+            values: values,
+            scale: scale,
+            mask: adjustedMask ?? .none
+        )
+        .transposed(0, 2, 1, 3)
+        .reshaped(B, L, -1)
+
+        return (oProj(output), (keys, values), currentOffset)
     }
 }
 
