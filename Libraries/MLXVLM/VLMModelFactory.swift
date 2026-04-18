@@ -78,12 +78,6 @@ private func create<C: Codable, P>(
 ///
 /// Typically called via ``LLMModelFactory/load(from:configuration:progressHandler:)``.
 public enum VLMTypeRegistry {
-
-    /// The set of model type strings supported by the VLM factory.
-    /// Use this to check if a model_type from config.json is a known VLM architecture.
-    public static let supportedModelTypes: Set<String> = Set(_creators.keys)
-
-    /// Shared instance with default model types.
     public static let shared: ModelTypeRegistry<LanguageModel> = .init(creators: [
         "paligemma": create(PaliGemmaConfiguration.self, PaliGemma.init),
         "qwen2_vl": create(Qwen2VLConfiguration.self, Qwen2VL.init),
@@ -93,34 +87,17 @@ public enum VLMTypeRegistry {
         "qwen3_5_moe": create(Qwen35Configuration.self, Qwen35MoE.init),
         "idefics3": create(Idefics3Configuration.self, Idefics3.init),
         "gemma3": create(Gemma3Configuration.self, Gemma3.init),
+        "gemma4": create(Gemma4Configuration.self, Gemma4.init),
         "smolvlm": create(SmolVLM2Configuration.self, SmolVLM2.init),
+        // TODO: see if we can make it work with fastvlm rather than llava_qwen2
         "fastvlm": create(FastVLMConfiguration.self, FastVLM.init),
         "llava_qwen2": create(FastVLMConfiguration.self, FastVLM.init),
         "pixtral": create(PixtralConfiguration.self, PixtralVLM.init),
-        "mistral3": { data in
-            // Mistral3 VLM may wrap Mistral4 text decoder — check text_config.model_type
-            struct TextCheck: Codable {
-                let textConfig: TextType?
-                struct TextType: Codable {
-                    let modelType: String?
-                    enum CodingKeys: String, CodingKey { case modelType = "model_type" }
-                }
-                enum CodingKeys: String, CodingKey { case textConfig = "text_config" }
-            }
-            if let check = try? JSONDecoder.json5().decode(TextCheck.self, from: data),
-                check.textConfig?.modelType == "mistral4"
-            {
-                let config = try JSONDecoder.json5().decode(Mistral4VLMConfiguration.self, from: data)
-                return Mistral4VLM(config)
-            }
-            let config = try JSONDecoder.json5().decode(Mistral3VLMConfiguration.self, from: data)
-            return Mistral3VLM(config)
-        },
+        "mistral3": create(Mistral3VLMConfiguration.self, Mistral3VLM.init),
         "lfm2_vl": create(LFM2VLConfiguration.self, LFM2VL.init),
         "lfm2-vl": create(LFM2VLConfiguration.self, LFM2VL.init),
         "glm_ocr": create(GlmOcrConfiguration.self, GlmOcr.init),
-        "gemma4": create(Gemma4Configuration.self, Gemma4.init),
-    ]
+    ])
 }
 
 public enum VLMProcessorTypeRegistry {
