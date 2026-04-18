@@ -124,16 +124,6 @@ let package = Package(
             ],
             path: "CompileBench"
         ),
-        .executableTarget(
-            name: "RunBench",
-            dependencies: [
-                "MLXLMCommon",
-                "MLXLLM",
-                "MLXVLM",
-                .product(name: "MLX", package: "mlx-swift"),
-            ],
-            path: "RunBench"
-        ),
         .testTarget(
             name: "MLXLMTests",
             dependencies: [
