@@ -158,9 +158,9 @@ private enum Language {
             self.headDim = args.headDim
             self.scale = pow(Float(headDim), -0.5)
 
-            self._wq.wrappedValue = Linear(dim, heads * headDim, bias: false)
-            self._wk.wrappedValue = Linear(dim, kvHeads * headDim, bias: false)
-            self._wv.wrappedValue = Linear(dim, kvHeads * headDim, bias: false)
+            self._wq.wrappedValue = Linear(dim, heads * headDim, bias: true)
+            self._wk.wrappedValue = Linear(dim, kvHeads * headDim, bias: true)
+            self._wv.wrappedValue = Linear(dim, kvHeads * headDim, bias: true)
             self._wo.wrappedValue = Linear(heads * headDim, dim, bias: false)
         }
 
@@ -454,6 +454,16 @@ private enum Vision {
         }
     }
 
+    fileprivate class VisionEmbeddings: Module {
+        @ModuleInfo(key: "position_embedding") var positionEmbedding: Embedding
+
+        init(_ config: GlmOcrConfiguration.VisionConfiguration) {
+            let numPatches = (config.imageSize / config.patchSize) * (config.imageSize / config.patchSize)
+            self._positionEmbedding.wrappedValue = Embedding(
+                embeddingCount: numPatches, dimensions: config.hiddenSize)
+        }
+    }
+
     fileprivate class Attention: Module {
 
         let numHeads: Int
@@ -462,8 +472,6 @@ private enum Vision {
 
         @ModuleInfo var qkv: Linear
         @ModuleInfo var proj: Linear
-        @ModuleInfo(key: "q_norm") var qNorm: RMSNorm
-        @ModuleInfo(key: "k_norm") var kNorm: RMSNorm
 
         public init(_ config: GlmOcrConfiguration.VisionConfiguration) {
             self.numHeads = config.numHeads
@@ -471,13 +479,9 @@ private enum Vision {
             self.scale = pow(Float(headDim), -0.5)
 
             self._qkv.wrappedValue = Linear(
-                config.hiddenSize, config.hiddenSize * 3, bias: true)
+                config.hiddenSize, config.hiddenSize * 3, bias: false)
             self._proj.wrappedValue = Linear(
-                config.hiddenSize, config.hiddenSize, bias: true)
-            self._qNorm.wrappedValue = RMSNorm(
-                dimensions: headDim, eps: config.rmsNormEps)
-            self._kNorm.wrappedValue = RMSNorm(
-                dimensions: headDim, eps: config.rmsNormEps)
+                config.hiddenSize, config.hiddenSize, bias: false)
         }
 
         public func callAsFunction(
@@ -492,9 +496,6 @@ private enum Vision {
             var q = parts[0].squeezed(axis: 0)
             var k = parts[1].squeezed(axis: 0)
             let v = parts[2].squeezed(axis: 0)
-
-            q = qNorm(q)
-            k = kNorm(k)
 
             q = applyRotaryPosEmbVision(q, freqs: rotaryPositionEmbedding)
             k = applyRotaryPosEmbVision(k, freqs: rotaryPositionEmbedding)
@@ -534,11 +535,11 @@ private enum Vision {
 
         public init(_ config: GlmOcrConfiguration.VisionConfiguration) {
             self._gate.wrappedValue = Linear(
-                config.hiddenSize, config.intermediateSize, bias: true)
+                config.hiddenSize, config.outHiddenSize, bias: false)
             self._up.wrappedValue = Linear(
-                config.hiddenSize, config.intermediateSize, bias: true)
+                config.hiddenSize, config.outHiddenSize, bias: false)
             self._down.wrappedValue = Linear(
-                config.intermediateSize, config.hiddenSize, bias: true)
+                config.outHiddenSize, config.hiddenSize, bias: false)
         }
 
         public func callAsFunction(_ x: MLXArray) -> MLXArray {
@@ -602,9 +603,11 @@ private enum Vision {
 
         @ModuleInfo(key: "patch_embed") var patchEmbed: PatchEmbed
         let rotaryPosEmb: QwenVL.VisionRotaryEmbedding
+        @ModuleInfo(key: "embeddings") var embeddings: VisionEmbeddings
         @ModuleInfo(key: "blocks") var blocks: [GlmOcrVisionBlock]
         @ModuleInfo var downsample: Conv2d
         @ModuleInfo var merger: PatchMerger
+        @ModuleInfo(key: "post_conv_layernorm") var postConvLayernorm: RMSNorm
         @ModuleInfo(key: "post_layernorm") var postLayernorm: RMSNorm
 
         let spatialMergeSize: Int
@@ -617,6 +620,8 @@ private enum Vision {
             let headDim = config.hiddenSize / config.numHeads
             self.rotaryPosEmb = QwenVL.VisionRotaryEmbedding(
                 dimensions: headDim / 2, theta: 10_000)
+
+            self._embeddings.wrappedValue = VisionEmbeddings(config)
 
             self._blocks.wrappedValue = (0 ..< config.depth).map { _ in
                 GlmOcrVisionBlock(config)
@@ -631,8 +636,10 @@ private enum Vision {
 
             self._merger.wrappedValue = PatchMerger(
                 dim: config.outHiddenSize,
-                contextDim: config.outHiddenSize * config.inChannels)
+                contextDim: config.intermediateSize)
 
+            self._postConvLayernorm.wrappedValue = RMSNorm(
+                dimensions: config.hiddenSize, eps: config.rmsNormEps)
             self._postLayernorm.wrappedValue = RMSNorm(
                 dimensions: config.hiddenSize, eps: config.rmsNormEps)
         }
@@ -682,6 +689,14 @@ private enum Vision {
 
         public func callAsFunction(_ hiddenStates: MLXArray, frames: [THW]) -> MLXArray {
             var hiddenStates = patchEmbed(hiddenStates)
+            hiddenStates = postConvLayernorm(hiddenStates)
+
+            // Apply position embeddings
+            // For simplicity, use sequential position IDs for now
+            let seqLen = hiddenStates.dim(0)
+            let positionIds = MLXArray(0 ..< seqLen)
+            hiddenStates = hiddenStates + embeddings.positionEmbedding(positionIds)
+
             let rotaryPosEmbedding = rotaryPositionEmbedding(frames)
 
             // Compute cu_seqlens from frames
@@ -831,7 +846,8 @@ public struct GlmOcrProcessor: UserInputProcessor {
     public func prepare(input: UserInput) async throws -> LMInput {
         let messages = GlmOcrMessageGenerator().generate(from: input)
 
-        var promptTokens = try tokenizer.applyChatTemplate(messages: messages)
+        var promptTokens = try tokenizer.applyChatTemplate(
+            messages: messages, tools: input.tools, additionalContext: input.additionalContext)
 
         // Text-only input
         if input.images.isEmpty, input.videos.isEmpty {
@@ -1132,6 +1148,7 @@ public struct GlmOcrConfiguration: Codable, Sendable {
         public let intermediateSize: Int
         public let numHeads: Int
         public let patchSize: Int
+        public let imageSize: Int
         public let outHiddenSize: Int
         public let spatialMergeSize: Int
         public let temporalPatchSize: Int
@@ -1146,6 +1163,7 @@ public struct GlmOcrConfiguration: Codable, Sendable {
             case intermediateSize = "intermediate_size"
             case numHeads = "num_heads"
             case patchSize = "patch_size"
+            case imageSize = "image_size"
             case outHiddenSize = "out_hidden_size"
             case spatialMergeSize = "spatial_merge_size"
             case temporalPatchSize = "temporal_patch_size"
