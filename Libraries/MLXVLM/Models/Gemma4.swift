@@ -24,6 +24,32 @@ private let compiledLogitSoftcap: @Sendable (MLXArray, MLXArray) -> MLXArray = {
 }()
 
 
+public struct Gemma4MessageGenerator: MessageGenerator {
+    public init() {}
+
+    public func generate(message: Chat.Message) -> MLXLMCommon.Message {
+        if message.role == .system {
+            [
+                "role": message.role.rawValue,
+                "content": message.content,
+            ]
+        } else {
+            [
+                "role": message.role.rawValue,
+                "content": message.images.map { _ in
+                    ["type": "image"]
+                }
+                    + message.videos.map { _ in
+                        ["type": "video"]
+                    }
+                    + [
+                        ["type": "text", "text": message.content]
+                    ],
+            ]
+        }
+    }
+}
+
 // MARK: - Shared Norm Utilities
 
 /// Standard Gemma4 RMSNorm — weight used directly, NO +1 offset
@@ -979,7 +1005,7 @@ public struct Gemma4Processor: UserInputProcessor {
     }
 
     public func prepare(input: UserInput) async throws -> LMInput {
-        let messages = Qwen2VLMessageGenerator().generate(from: input)
+        let messages = Gemma4MessageGenerator().generate(from: input)
         var tokens = try tokenizer.applyChatTemplate(messages: messages, tools: input.tools, additionalContext: input.additionalContext)
 
         var processedImage: LMInput.ProcessedImage?
