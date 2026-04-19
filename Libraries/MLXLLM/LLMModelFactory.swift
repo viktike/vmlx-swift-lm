@@ -682,7 +682,7 @@ public final class LLMModelFactory: GenericModelFactory {
         var mutableConfiguration = configuration
         mutableConfiguration.eosTokenIds = eosTokenIds
         if mutableConfiguration.toolCallFormat == nil {
-            mutableConfiguration.toolCallFormat = ToolCallFormat.infer(from: baseConfig.modelType)
+            mutableConfiguration.toolCallFormat = ToolCallFormat.infer(from: baseConfig.modelType, configData: configData)
         }
 
         // Detect JANG model — if jang_config.json exists, load it for per-layer quantization.
