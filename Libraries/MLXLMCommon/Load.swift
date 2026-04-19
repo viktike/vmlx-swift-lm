@@ -213,6 +213,9 @@ public func loadWeights(
         }
     }
 
+    // Ensure inference mode (some models gate fast kernels on training == false).
+    model.train(false)
+
     eval(model)
 }
 

@@ -78,13 +78,17 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     /// Example: `func<arg_key>k</arg_key><arg_value>v</arg_value>`
     case glm4
 
-    /// Gemma 3 function call format.
+    /// Gemma function call format.
     /// Example: `<start_function_call>call:name{key:<escape>value<escape>}<end_function_call>`
     case gemma
 
     /// Gemma 4 function call format (different tags from Gemma 3).
     /// Example: `<|tool_call>call:name{key:<|"|>value<|"|>}<tool_call|>`
     case gemma4
+
+    /// Gemma3 tool calling format.
+    /// Example: ```tool_code\n{"name": "func", "arguments": {...}}\n```
+    case gemma3
 
     /// Kimi K2 format with functions prefix.
     /// Example: `functions.name:0<|tool_call_argument_begin|>{"key": "value"}`
@@ -115,6 +119,8 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             return GLM4ToolCallParser()
         case .gemma:
             return GemmaFunctionParser()
+        case .gemma3:
+            return JSONToolCallParser(startTag: "```tool_code", endTag: "```")
         case .gemma4:
             return GemmaFunctionParser(
                 startTag: "<|tool_call>", endTag: "<tool_call|>", escapeMarker: "<|\"|>")
@@ -151,7 +157,10 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         if type.hasPrefix("gemma4") {
             return .gemma4
         }
-        if type.hasPrefix("gemma3") || type == "gemma" {
+        if type.hasPrefix("gemma3") {
+            return .gemma3
+        }
+        if type.hasPrefix("gemma") {
             return .gemma
         }
 
@@ -170,8 +179,13 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             return .xmlFunction
         }
 
-        // Mistral3 family (mistral3, mistral3_text, etc.)
-        if type.hasPrefix("mistral3") {
+        // Qwen3-Next family (qwen3_next, etc.)
+        if type.hasPrefix("qwen3_next") {
+            return .xmlFunction
+        }
+
+        // Mistral3 family (mistral3, mistral3_text, mistral, etc.)
+        if type.hasPrefix("mistral") {
             return .mistral
         }
 
@@ -210,7 +224,7 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         case "minimax", "minimax_m2_5":
             return .minimaxM2
         // GLM 4.x / 5 / DeepSeek tool format (arg_key / arg_value tags).
-        case "glm47", "glm5", "glm4_moe", "deepseek":
+        case "glm47", "glm5", "glm4_moe", "deepseek", "glm4v":
             return .glm4
         // Nemotron-H / Cascade — same XML-style envelope as Qwen3 Coder.
         // Our `XMLFunctionParser` handles `<tool_call><function=name>…`
@@ -228,7 +242,7 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         case "gemma4":
             return .gemma4
         // Mistral 4 — `[TOOL_CALLS] … [ARGS] …` JSON delimiters.
-        case "mistral", "mistral4":
+        case "mistral", "mistral3", "mistral4":
             return .mistral
         // LFM2 — pythonic `[func(arg='v')]` between
         // `<|tool_call_start|>` / `<|tool_call_end|>`.
