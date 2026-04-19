@@ -22,7 +22,7 @@ extension LLMModel {
     public func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws
         -> PrepareResult
     {
-        let prefillStepSize = windowSize ?? 512
+        let prefillStepSize = windowSize ?? 1024
 
         // Work on a flat 1D view of the tokens internally so the slicing math
         // below is dimension-independent. Callers may pass tokens either as

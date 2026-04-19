@@ -164,7 +164,7 @@ public struct GenerateParameters: Sendable {
         presenceContextSize: Int = 20,
         frequencyPenalty: Float? = nil,
         frequencyContextSize: Int = 20,
-        prefillStepSize: Int = 512
+        prefillStepSize: Int = 1024
     ) {
         self.maxTokens = maxTokens
         self.maxKVSize = maxKVSize
@@ -791,7 +791,7 @@ public struct TokenIterator: TokenIteratorProtocol {
     ///   - maxTokens: maximum number of tokens to generate
     public init(
         input: LMInput, model: any LanguageModel, cache: [KVCache]? = nil,
-        processor: LogitProcessor?, sampler: LogitSampler, prefillStepSize: Int = 512,
+        processor: LogitProcessor?, sampler: LogitSampler, prefillStepSize: Int = 1024,
         maxTokens: Int? = nil
     ) throws {
         self.model = model
