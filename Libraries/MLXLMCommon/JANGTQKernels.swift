@@ -355,7 +355,7 @@ public enum JANGTQKernels {
     /// `signs` must be shape `(dim,)` fp32.
     public static func hadamardRotate(_ x: MLXArray, signs: MLXArray, dim: Int) -> MLXArray {
         // Flatten leading dims into batch
-        var xFlat = x.reshaped([-1, dim]).asType(.float32)
+        let xFlat = x.reshaped([-1, dim]).asType(.float32)
         let batch = xFlat.shape[0]
         let meta = makeHadamardMeta(totalDim: dim)
         let blocks = decomposePow2(dim)

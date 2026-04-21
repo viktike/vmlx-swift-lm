@@ -636,7 +636,7 @@ private class TextRouter: Module {
         super.init()
     }
     func callAsFunction(_ x: MLXArray) -> (MLXArray, MLXArray) {
-        var h = rmsNormNoScale(x, eps: eps) * rs * sc
+        let h = rmsNormNoScale(x, eps: eps) * rs * sc
         let s = proj(h); let p = softmax(s, axis: -1)
         let ti = argPartition(MLXArray(0) - s, kth: topK - 1, axis: -1)[.ellipsis, ..<topK]
         var tw = takeAlong(p, ti, axis: -1); tw = tw / tw.sum(axis: -1, keepDims: true); tw = tw * pes[ti]
@@ -1011,7 +1011,7 @@ public struct Gemma4Processor: UserInputProcessor {
         var processedImage: LMInput.ProcessedImage?
         if !input.images.isEmpty {
             let ps = config.patchSize; let maxP = config.maxSoftTokens * config.poolingKernelSize * config.poolingKernelSize
-            var arrays = try input.images.map { img -> MLXArray in
+            let arrays = try input.images.map { img -> MLXArray in
                 let ci = try img.asCIImage()
                 let (w, h) = (Int(ci.extent.width), Int(ci.extent.height))
                 let f = sqrt(Float(maxP * ps * ps) / Float(w * h))
