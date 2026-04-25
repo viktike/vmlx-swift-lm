@@ -47,7 +47,7 @@ public final class ModelContainer: Sendable {
     /// Enable multi-tier KV caching with the given configuration.
     /// Call after model loading. Safe to call multiple times (replaces previous coordinator).
     /// Auto-detects hybrid models and sets modelKey from configuration if not provided.
-    public func enableCaching(config: CacheCoordinatorConfig = CacheCoordinatorConfig()) {
+    public func enableCaching(config: CacheCoordinatorConfig = CacheCoordinatorConfig(), hybrid: Bool = false) {
         var config = config
         // Auto-set modelKey from model configuration if not provided
         if config.modelKey == nil {
@@ -56,6 +56,9 @@ public final class ModelContainer: Sendable {
             config.modelKey = "\(ObjectIdentifier(self))"
         }
         let coordinator = CacheCoordinator(config: config)
+
+        coordinator.setHybrid(hybrid)
+
         _cacheCoordinator.withLock { $0 = coordinator }
     }
 
@@ -63,8 +66,11 @@ public final class ModelContainer: Sendable {
     /// Call after model loading. Inspects the model's cache types to detect SSM layers.
     public func enableCachingAsync(config: CacheCoordinatorConfig = CacheCoordinatorConfig()) async {
         var config = config
-        let modelConfig = await context.read { $0.configuration }
-        config.modelKey = modelConfig.name
+        // Auto-set modelKey from model configuration if not provided
+        if config.modelKey == nil {
+            let modelConfig = await context.read { $0.configuration }
+            config.modelKey = modelConfig.name
+        }
 
         let coordinator = CacheCoordinator(config: config)
 
@@ -73,6 +79,7 @@ public final class ModelContainer: Sendable {
             let testCache = ctx.model.newCache(parameters: nil)
             return testCache.contains { $0 is MambaCache || $0 is ArraysCache }
         }
+
         coordinator.setHybrid(isHybrid)
 
         _cacheCoordinator.withLock { $0 = coordinator }
