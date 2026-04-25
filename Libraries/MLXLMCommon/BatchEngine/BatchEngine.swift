@@ -496,8 +496,20 @@ public actor BatchEngine {
                 stepsSinceMemoryPurge = 0
             }
 
-            // 5. Yield to allow submit() calls and stream consumers to run
-            await Task.yield()
+            // 5. Yield to allow submit() calls and stream consumers to
+            //    run. `Task.yield()` in the hot decode path costs
+            //    ~1-2ms per token on Apple M-series (a full scheduler
+            //    round-trip). At B == 1 steady state with no pending
+            //    work, the continuation.yield(.token) we already do
+            //    above is a non-blocking enqueue and the consumer Task
+            //    runs in parallel on the async executor — we don't
+            //    need the extra yield. Only yield when there's work
+            //    that could be starved (new admissions waiting or
+            //    multi-slot fan-out where the scheduler needs to
+            //    interleave with submit() on the actor).
+            if !waitQueue.isEmpty || activeSlots.count > 1 {
+                await Task.yield()
+            }
         }
 
         loopTask = nil
@@ -508,7 +520,43 @@ public actor BatchEngine {
     /// Move requests from the wait queue into active slots up to `maxBatchSize`.
     private func admitPendingRequests() {
         while activeSlots.count < maxBatchSize && !waitQueue.isEmpty {
-            let request = waitQueue.removeFirst()
+            var request = waitQueue.removeFirst()
+
+            // LONG-CTX (2026-04-21): apply the coordinator's KV-sizing
+            // defaults before we allocate the slot's cache.
+            //
+            // Osaurus 0.17.0 removed its per-request `maxKVSize` UI knob
+            // with the comment "KV cache sizing is owned end-to-end by
+            // vmlx-swift-lm's CacheCoordinator". The coordinator honors
+            // that contract here: when `GenerateParameters.kvMode` is
+            // `.none` or `maxKVSize` is nil, the coordinator's
+            // `defaultKVMode` / `defaultMaxKVSize` fill the gap. Requests
+            // that did set their own values are untouched.
+            //
+            // The default `maxKVSize` is only applied to prompts that
+            // exceed `longPromptMultiplier × defaultMaxKVSize` — short
+            // chat turns never take a rotating-window hit from a global
+            // cap they didn't opt into.
+            if let coordinator = cacheCoordinator {
+                let promptCount = request.input.text.tokens.size
+                let (effMode, effMax) = coordinator.config.resolveKVPolicy(
+                    kvMode: request.parameters.kvMode,
+                    maxKVSize: request.parameters.maxKVSize,
+                    promptTokenCount: promptCount
+                )
+                if effMode != request.parameters.kvMode {
+                    request.parameters.kvMode = effMode
+                    Self.logger.info(
+                        "Slot \(request.id.description, privacy: .public): applied coordinator defaultKVMode"
+                    )
+                }
+                if effMax != request.parameters.maxKVSize {
+                    request.parameters.maxKVSize = effMax
+                    Self.logger.info(
+                        "Slot \(request.id.description, privacy: .public): applied coordinator defaultMaxKVSize=\(effMax ?? -1) for \(promptCount)-token prompt"
+                    )
+                }
+            }
 
             // Stage 0: warn if the request asks for a KV-quant mode not yet
             // supported under batched decode (affine / legacy kvBits).
@@ -567,7 +615,20 @@ public actor BatchEngine {
         }
 
         // Phase 2: Batch-decode all slots that are in decode phase.
-        let decodeIndices = activeSlots.indices.filter { activeSlots[$0].phase == .decode }
+        // Pick slots that are (a) in decode phase AND (b) not already
+        // finished. The `!isFinished` check catches the edge case where
+        // `stepPrefill` sampled an EOS as the very first decode token —
+        // it sets `phase = .decode` before the EOS check, calls
+        // `finishSlot`, sets `isFinished = true`, and leaves `nextToken`
+        // nil (the non-EOS branch is where `nextToken` gets assigned).
+        // Without this guard, `stepBatchDecode` force-unwraps that nil
+        // `nextToken` at the `stacked(...)` call and crashes. The
+        // `activeSlots.removeAll { $0.isFinished }` sweep runs AFTER
+        // this phase, so finished slots remain visible here within the
+        // same scheduling iteration.
+        let decodeIndices = activeSlots.indices.filter {
+            activeSlots[$0].phase == .decode && !activeSlots[$0].isFinished
+        }
         if !decodeIndices.isEmpty {
             stepBatchDecode(slotIndices: decodeIndices)
         }
@@ -669,14 +730,56 @@ public actor BatchEngine {
                         )
                         slot.cache = context.model.newCache(parameters: slot.parameters)
                         inputForPrepare = slot.originalInput
-                    } else if remaining.isEmpty {
-                        // Full cache hit — feed last token to seed decode
-                        let lastToken = MLXArray([Int32(tokenIds.last!)])
+                    } else if remaining.isEmpty, let last = tokenIds.last {
+                        // Full cache hit — feed last token to seed decode.
+                        // Tensor must be 2D `[1, 1]`: the Qwen3_5 VLM
+                        // `Qwen35Language.LanguageModel` reads
+                        // `inputs.dim(1)` during position-id compute and
+                        // crashes MLX with `SmallVector out of range`
+                        // (array.cpp:335) on a 1D input. All other
+                        // model forwards either broadcast 2D already
+                        // or tolerate the extra leading axis — matches
+                        // the sibling `Evaluate.swift:825` fix.
+                        //
+                        // Trim cache offset back to (promptLen - 1) before
+                        // re-feeding the last token. Disk-tier hits restore
+                        // KV for `promptLen + previousDecodeLen` entries
+                        // (storage runs at finishSlot AFTER decode), so
+                        // without trimming the model would re-feed the
+                        // last prompt token at position `promptLen +
+                        // previousDecodeLen` — RoPE then rotates by the
+                        // wrong angle and the resulting logits typically
+                        // sample EOS first-token, yielding 0 generated
+                        // tokens (BENCH_BATCH_DISK_RESTORE 2026-04-24).
+                        // Trim is a no-op for paged-tier hits because
+                        // their `remaining.isEmpty == true` branch is
+                        // only reached when the matched count already
+                        // equals promptLen and offset already equals
+                        // promptLen.
+                        let promptLen = tokenIds.count
+                        let cacheOffset = slot.cache.first?.offset ?? promptLen
+                        let trimNeeded = cacheOffset - (promptLen - 1)
+                        if trimNeeded > 0 {
+                            for layer in slot.cache where layer.isTrimmable {
+                                _ = layer.trim(trimNeeded)
+                            }
+                        }
+                        let lastToken = MLXArray([Int32(last)])
+                            .expandedDimensions(axis: 0)
                         inputForPrepare = LMInput(
                             text: LMInput.Text(tokens: lastToken),
                             image: nil, video: nil)
+                    } else if remaining.isEmpty {
+                        // Defensive fallback: no last token → roll back.
+                        slot.cache = context.model.newCache(parameters: slot.parameters)
+                        inputForPrepare = slot.originalInput
+                        Self.logger.error(
+                            "Slot \(slot.id.description, privacy: .public): cache .hit returned empty tokenIds — rolling back to full prefill"
+                        )
                     } else {
+                        // Remaining tokens path — same 2D shape contract.
                         let remainingArray = MLXArray(remaining.map { Int32($0) })
+                            .expandedDimensions(axis: 0)
                         inputForPrepare = LMInput(
                             text: LMInput.Text(tokens: remainingArray),
                             image: nil, video: nil)
@@ -725,6 +828,46 @@ public actor BatchEngine {
         slot.phase = .decode
         slot.decodeStartTime = Date()
         slot.pendingTokens = MLXArray([Int32]()) // clear
+
+        // Hybrid-SSM cross-turn cache seed: after prefill completes for
+        // a hybrid-SSM slot, snapshot the SSM companion state keyed by
+        // the prompt length and store it into the coordinator's
+        // ``SSMStateCache``. On the next turn where a paged KV cache
+        // hit covers a prefix ending at this same boundary, the
+        // coordinator fetches the SSM state alongside the KV blocks,
+        // and the partial-hit-rollback is no longer needed.
+        //
+        // Runs INLINE on the BatchEngine actor after MLX eval has
+        // already completed — no detached Task, no cross-actor MLX
+        // submission. Safe under strict concurrency and Metal
+        // command-encoder lifetime (unlike the earlier SSMReDeriver
+        // attempt; see TOOL-CALL-STRUCTURED-CONTRACT.md for the
+        // regression + revert history).
+        //
+        // Heuristic gate: only emit the seed when the slot cache
+        // contains a Mamba or ArraysCache layer. Pure-attention
+        // models carry no SSM companion state; emitting a zero-array
+        // entry would needlessly cost LRU budget.
+        if let coordinator = cacheCoordinator, coordinator.isHybrid {
+            let hasSSM = slot.cache.contains {
+                $0 is MambaCache || $0 is ArraysCache
+            }
+            if hasSSM {
+                let promptTokens = slot.originalInput.text.tokens
+                    .asArray(Int.self)
+                let ssmStates = extractSSMStates(from: slot.cache)
+                if !ssmStates.isEmpty {
+                    coordinator.ssmStateCache.store(
+                        ssmStates: ssmStates,
+                        tokens: promptTokens,
+                        boundary: promptTokens.count
+                    )
+                    Self.logger.debug(
+                        "Slot \(slot.id.description, privacy: .public): stored SSM seed at boundary=\(promptTokens.count) (\(ssmStates.count) state arrays)"
+                    )
+                }
+            }
+        }
 
         // Stage 0: KV-quant compression hook. For requests with
         // `kvMode: .turboQuant(...)`, this swaps `KVCacheSimple` layers for
@@ -1015,39 +1158,65 @@ public actor BatchEngine {
             return
         }
 
+        // Defensive filter: drop any slot whose `nextToken` is nil
+        // instead of force-unwrapping. The caller already filters on
+        // `phase == .decode && !isFinished`, so this path SHOULD never
+        // surface a nil — but a future regression (new stepPrefill
+        // branch that transitions to .decode without setting
+        // nextToken, cancel race, etc.) would crash the whole engine
+        // instead of dropping one slot. Log when it happens so the
+        // invariant violation is observable, not silent.
+        let liveIndices = slotIndices.compactMap { idx -> (Int, MLXArray)? in
+            if let tok = self.activeSlots[idx].nextToken {
+                return (idx, tok)
+            }
+            Self.logger.error(
+                "Slot \(self.activeSlots[idx].id.description, privacy: .public): nil nextToken in stepBatchDecode — dropping from batch"
+            )
+            return nil
+        }
+        guard !liveIndices.isEmpty else { return }
+        let slotIndices = liveIndices.map { $0.0 }
+        let tokenArrays = liveIndices.map { $0.1 }
         let B = slotIndices.count
 
         // Build batched input: [B, 1]
-        let tokenArrays = slotIndices.map { activeSlots[$0].nextToken! }
         let batchTokens = stacked(tokenArrays).reshaped(B, 1)
 
-        // Build per-layer batched cache wrappers.
-        // Each cache type gets its appropriate batch wrapper:
-        // - KVCacheSimple/RotatingKVCache → BatchKVCache (split/pad/stack)
-        // - ArraysCache/MambaCache → BatchArraysCache (merge along batch dim)
-        // - CacheList → BatchCacheList (wraps each sub-cache appropriately)
+        // Per-layer batched cache wrappers. For B > 1 we need the
+        // Batch wrappers to split/pad/stack per-slot caches across the
+        // batch dim. For B == 1 the wrappers are pure overhead:
+        // BatchKVCache allocates an offsetArray and adds a Swift
+        // dispatch per update() call on every layer on every token.
+        // On a hybrid-SSM 35B-A3B MoE decode with 48 plus layers that
+        // is meaningful. Direct-pass at B == 1 recovers the overhead.
         let numLayers = activeSlots[slotIndices[0]].cache.count
         var layerCaches = [KVCache]()
         var batchArraysCaches = [BatchArraysCache]()  // track for splitBack
         var batchCacheLists = [BatchCacheList]()       // track for splitBack
         layerCaches.reserveCapacity(numLayers)
 
-        for layer in 0 ..< numLayers {
-            let slotCachesForLayer = slotIndices.map { activeSlots[$0].cache[layer] }
-            let representative = slotCachesForLayer[0]
+        if B == 1 {
+            // Direct pass-through — no per-token wrapper allocation.
+            layerCaches.append(contentsOf: activeSlots[slotIndices[0]].cache)
+        } else {
+            for layer in 0 ..< numLayers {
+                let slotCachesForLayer = slotIndices.map { activeSlots[$0].cache[layer] }
+                let representative = slotCachesForLayer[0]
 
-            if let _ = representative as? CacheList {
-                let cacheLists = slotCachesForLayer.map { $0 as! CacheList }
-                let batchCL = BatchCacheList(slotCacheLists: cacheLists)
-                layerCaches.append(batchCL)
-                batchCacheLists.append(batchCL)
-            } else if let _ = representative as? ArraysCache {
-                let arraysCaches = slotCachesForLayer.map { $0 as! ArraysCache }
-                let batchAC = BatchArraysCache(slotCaches: arraysCaches)
-                layerCaches.append(batchAC)
-                batchArraysCaches.append(batchAC)
-            } else {
-                layerCaches.append(BatchKVCache(slotCaches: slotCachesForLayer))
+                if let _ = representative as? CacheList {
+                    let cacheLists = slotCachesForLayer.map { $0 as! CacheList }
+                    let batchCL = BatchCacheList(slotCacheLists: cacheLists)
+                    layerCaches.append(batchCL)
+                    batchCacheLists.append(batchCL)
+                } else if let _ = representative as? ArraysCache {
+                    let arraysCaches = slotCachesForLayer.map { $0 as! ArraysCache }
+                    let batchAC = BatchArraysCache(slotCaches: arraysCaches)
+                    layerCaches.append(batchAC)
+                    batchArraysCaches.append(batchAC)
+                } else {
+                    layerCaches.append(BatchKVCache(slotCaches: slotCachesForLayer))
+                }
             }
         }
 
@@ -1059,8 +1228,14 @@ public actor BatchEngine {
         )
         // result.logits shape: [B, 1, vocabSize]
 
-        // Synchronize — we need to read token values for EOS checking
-        MLX.eval(result.logits)
+        // Async-eval the logits so GPU work kicks off while we do the
+        // Swift-side bookkeeping below. We MUST still materialize
+        // `tokenID` via `.item(Int.self)` for the EOS check (forces a
+        // sync point), but by that time the forward has already been
+        // in flight — saving the serialized `eval` → wait → sample
+        // path that cost ~15% decode tok/s on hybrid-SSM 35B-A3B. This
+        // mirrors `TokenIterator.next()`'s `asyncEval(token)` pattern.
+        asyncEval(result.logits)
 
         // Split SSM states back to per-sequence caches
         for batchAC in batchArraysCaches {
@@ -1070,13 +1245,31 @@ public actor BatchEngine {
             batchCL.splitBack()
         }
 
+        // Sample per sequence (lazy MLXArrays), then asyncEval the
+        // whole batch of sampled tokens so the GPU sampling work
+        // runs concurrently with the Swift-side bookkeeping below.
+        // Mirrors `TokenIterator.next()`'s `asyncEval(token)` idiom
+        // which is what gave the non-batch path its +15% edge on
+        // 35B-A3B models.
+        var sampledTokens: [MLXArray] = []
+        sampledTokens.reserveCapacity(slotIndices.count)
+        for (batchIdx, slotIdx) in slotIndices.enumerated() {
+            let logits = result.logits[batchIdx ..< batchIdx + 1, 0, 0...]
+            var slot = activeSlots[slotIdx]
+            let token = slot.sampleToken(from: logits)
+            sampledTokens.append(token)
+            activeSlots[slotIdx] = slot
+        }
+        asyncEval(sampledTokens)
+
         // Sample per sequence and route results
         for (batchIdx, slotIdx) in slotIndices.enumerated() {
             var slot = activeSlots[slotIdx]
-
-            // Extract this sequence's logits as [1, vocabSize] (2D) for processor compatibility.
-            let logits = result.logits[batchIdx ..< batchIdx + 1, 0, 0...]
-            let token = slot.sampleToken(from: logits)
+            let token = sampledTokens[batchIdx]
+            // `.item(Int.self)` forces eval of the sampled-token op.
+            // GPU is already running (kicked off by asyncEval above
+            // of both the logits and the sampled tokens) — this wait
+            // is much shorter than a synchronous eval + sample chain.
             let tokenID = token.item(Int.self)
 
             // Stage 0: per-step KV-quant compression hook. For slots with

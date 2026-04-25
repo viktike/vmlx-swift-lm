@@ -70,7 +70,31 @@ public enum LLMTypeRegistry {
             "cohere": create(CohereConfiguration.self, CohereModel.init),
             "openelm": create(OpenElmConfiguration.self, OpenELMModel.init),
             "internlm2": create(InternLM2Configuration.self, InternLM2Model.init),
-            "deepseek_v3": create(DeepseekV3Configuration.self, DeepseekV3Model.init),
+            // DeepSeek-V3 / Kimi K2.6 (kimi_k25, kimi_k2) — all share
+            // the same MLA + MoE text backbone. Factory peeks
+            // `weight_format == "mxtq"` and routes to the JANGTQ
+            // variant (routed experts via TurboQuantSwitchGLU + codebook
+            // Metal kernels) when present; standard affine / fp8
+            // bundles continue to use `DeepseekV3Model`.
+            //
+            // Coverage:
+            //   - model_type = deepseek_v3  : DeepSeek-V3 upstream + JANGTQ
+            //   - model_type = kimi_k25     : Kimi K2.6 REAP-30/50 + JANGTQ
+            //   - model_type = kimi_k2      : pre-K2.6 Kimi naming
+            //
+            // Reference:
+            //   jang/research/KIMI-K2.6-VMLX-INTEGRATION.md §2 (Swift)
+            //   jang/research/KIMI-K2.6-IMPLEMENTATION.md §4.1 (MLA)
+            //
+            // The current `DeepseekV3Attention` uses prefill-style K/V
+            // materialization on every step (no L==1 absorb branch), so
+            // it does NOT need the MLA fp32-SDPA patch the Python
+            // runtime requires. ~1.5× decode slowdown vs Python's
+            // absorb path — deliberate correctness-over-speed
+            // trade-off.
+            "deepseek_v3": dispatchDeepseekV3Family,
+            "kimi_k25": dispatchDeepseekV3Family,
+            "kimi_k2": dispatchDeepseekV3Family,
             "granite": create(GraniteConfiguration.self, GraniteModel.init),
             "granitemoehybrid": create(
                 GraniteMoeHybridConfiguration.self, GraniteMoeHybridModel.init),
@@ -143,7 +167,155 @@ public enum LLMTypeRegistry {
                 return Mistral3TextModel(config)
             },
             "apertus": create(ApertusConfiguration.self, ApertusModel.init),
+            // DSV4 (DeepSeek-V4-Flash / -Pro): architecturally distinct
+            // from DSV3 — mHC residual stream, CSA/HCA hybrid attention,
+            // sqrtsoftplus gate, grouped low-rank O, sliding window,
+            // hash routing on layers 0-2. Would PRODUCE GARBAGE if routed
+            // through DeepseekV3Model. Throw a clear error pointing at
+            // the port plan instead of silently dispatching to DSV3.
+            //
+            // Model weights for DSV4 are also FP4 + FP8 mixed — the
+            // standard safetensors loader doesn't know how to dequant
+            // them, so even a DSV3-shaped fallback would fail at load
+            // time with a less-useful error.
+            //
+            // Swift port plan + status:
+            //   Libraries/MLXLLM/Models/DSV4-PORT-STATUS.md
+            "deepseek_v4": dispatchDeepseekV4,
         ]
+    }
+
+    /// Dispatcher for the DeepSeek-V3 family (deepseek_v3, kimi_k25,
+    /// kimi_k2). Peeks `weight_format` in config.json — `"mxtq"`
+    /// routes to `DeepseekV3JANGTQModel` (TurboQuantSwitchGLU for
+    /// routed experts + Metal codebook kernels); every other value
+    /// routes to the standard `DeepseekV3Model`.
+    ///
+    /// Keeps as a top-level helper (not an inline closure) so the
+    /// three model_type entries in `extendedModels()` share one code
+    /// path. Any future DeepSeek-V3-family alias just adds a dict
+    /// entry pointing here.
+    /// DSV4 dispatch placeholder. Throws a structured error pointing
+    /// at the port plan until `DeepseekV4.swift` /
+    /// `DeepseekV4JANGTQ.swift` land. Keeping the registration means:
+    ///
+    ///   - osaurus gets a CLEAR error saying DSV4 isn't supported yet
+    ///     instead of a cryptic "bundle silently produced garbage";
+    ///   - model_type reasoning/tool plumbing (which already handles
+    ///     `deepseek*` prefix correctly) keeps working — just the
+    ///     forward pass is gated;
+    ///   - test harness can exercise the `kimi_k25`/`deepseek_v3`
+    ///     paths without triggering DSV4 errors.
+    ///
+    /// Follow `Libraries/MLXLLM/Models/DSV4-PORT-STATUS.md` to finish.
+    private static func dispatchDeepseekV4(data: Data) throws -> any LanguageModel {
+        // DeepseekV4 (JANGTQ + JANG family). The right variant depends
+        // on whether routed experts are stored as MXTQ codebook
+        // (TurboQuantSwitchGLU) or plain affine (SwitchGLU).
+        //
+        // Detection priority:
+        //   1. `weight_format: "mxtq"` in config.json — authoritative
+        //      when present (jang_config.json typically carries this
+        //      but some bundles stamp it on config.json instead).
+        //   2. `DSV4_FORCE_JANGTQ=1` env override — for bundles with
+        //      mislabeled jang_config (we've seen "bf16" stamped on
+        //      JANGTQ bundles in the wild). Sets the JANGTQ path.
+        //   3. Heuristic: DSV4 + `quantization.bits in {2, 4}` AND
+        //      `quantization.group_size == 32` AND no overriding
+        //      affine signal → JANGTQ. Reflects research §5: the
+        //      only DSV4-Flash distributions are JANGTQ_2L/4 and
+        //      JANG_2L/4. Both quant ladders. JANG_2L/JANG4 use
+        //      uniform affine (no `tq_packed` keys) — but they're
+        //      experimental per the bundle cheat-sheet, not the
+        //      primary production target.
+        //   4. Fallback: affine `DeepseekV4Model`.
+        struct FormatCheck: Codable {
+            let weightFormat: String?
+            let quantization: QuantInfo?
+            enum CodingKeys: String, CodingKey {
+                case weightFormat = "weight_format"
+                case quantization
+            }
+        }
+        struct QuantInfo: Codable {
+            let bits: Int?
+            let groupSize: Int?
+            enum CodingKeys: String, CodingKey {
+                case bits
+                case groupSize = "group_size"
+            }
+        }
+
+        let config = try JSONDecoder.json5().decode(
+            DeepseekV4Configuration.self, from: data)
+        let check = try? JSONDecoder.json5().decode(FormatCheck.self, from: data)
+        let forced = ProcessInfo.processInfo.environment["DSV4_FORCE_JANGTQ"] == "1"
+        let weightFormat = check?.weightFormat?.lowercased()
+        let isMxtqStamp =
+            weightFormat == "mxtq" || weightFormat == "jangtq2"
+            || weightFormat == "jangtq4"
+        // Heuristic match: need explicit force OR explicit mxtq stamp
+        // — purely heuristic dispatch on bits=2/4 alone is unsafe
+        // because JANG_2L (uniform affine 2-bit) shares those config
+        // values. Future improvement: peek the safetensors index for
+        // `tq_packed` keys when neither stamp nor env is set.
+        if isMxtqStamp || forced {
+            // mxtqBits sourcing — the routed-MoE codebook lives in
+            // `jangtq_runtime.safetensors` keyed `codebook.{inFeatures}.
+            // {bits}`. The bits THERE are authoritative — the
+            // `config.json` `quantization.bits` field describes the
+            // AFFINE non-routed block (often 8 for JANGTQ_2L) and
+            // doesn't match the codebook bits. Mismatch caused
+            // `TurboQuantSwitchLinear.forward` to fatalError("sidecar
+            // not loaded") when bits=8 was searched against a bits=2
+            // codebook (2026-04-25 reproducer on DSV4-Flash JANGTQ
+            // bundle whose config.json was regenerated with bits=8).
+            //
+            // Resolution priority:
+            //   1. `DSV4_JANGTQ_BITS` env override (4 for JANGTQ4
+            //      bundles, 2 for JANGTQ_2L).
+            //   2. Authoritative `weight_format` stamp:
+            //      `jangtq4` → 4, `jangtq2`/`mxtq` → 2.
+            //   3. Forced path (no stamp, env-only): default to 2 (the
+            //      canonical JANGTQ_2L distribution).
+            //   4. Heuristic — config.json bits, only when in {2, 4}.
+            //      Anything else is the affine non-routed bits and
+            //      doesn't match the codebook.
+            let env = ProcessInfo.processInfo.environment
+            let envBits = (env["DSV4_JANGTQ_BITS"]).flatMap { Int($0) }
+            let stampBits: Int? = {
+                switch weightFormat {
+                case "jangtq4": return 4
+                case "jangtq2", "mxtq": return 2
+                default: return nil
+                }
+            }()
+            let configBits: Int? = {
+                guard let b = check?.quantization?.bits, b == 2 || b == 4
+                else { return nil }
+                return b
+            }()
+            let mxtqBits = envBits ?? stampBits ?? configBits ?? 2
+            return DeepseekV4JANGTQModel(config, mxtqBits: mxtqBits, mxtqSeed: 42)
+        }
+        return DeepseekV4Model(config)
+    }
+
+    private static func dispatchDeepseekV3Family(data: Data) throws -> any LanguageModel {
+        struct FormatCheck: Codable {
+            let weightFormat: String?
+            enum CodingKeys: String, CodingKey { case weightFormat = "weight_format" }
+        }
+        if let check = try? JSONDecoder.json5().decode(FormatCheck.self, from: data),
+            check.weightFormat == "mxtq"
+        {
+            let config = try JSONDecoder.json5().decode(
+                DeepseekV3JANGTQConfiguration.self, from: data)
+            return DeepseekV3JANGTQModel(config)
+        }
+        let config = try JSONDecoder.json5().decode(
+            DeepseekV3Configuration.self, from: data)
+        return DeepseekV3Model(config)
     }
 
     /// Shared instance with default model types.
@@ -718,9 +890,18 @@ public final class LLMModelFactory: GenericModelFactory {
         var mutableConfiguration = configuration
         mutableConfiguration.eosTokenIds = eosTokenIds
         if mutableConfiguration.toolCallFormat == nil {
+            // New DSV4-era stamp lives under `chat.tool_calling.parser`
+            // (e.g. `"dsml"` for DeepSeek-V4-Flash). Keep the legacy
+            // `capabilities.tool_parser` path as the second priority
+            // — older bundles use it, and the new schema inherits it
+            // as a fallback. Finally `model_type` infer.
+            let chatStamped = ToolCallFormat.fromCapabilityName(
+                jangConfig?.chat?.toolCalling?.parser)
             let jangStamped = ToolCallFormat.fromCapabilityName(
                 jangConfig?.capabilities?.toolParser)
-            mutableConfiguration.toolCallFormat = jangStamped
+            mutableConfiguration.toolCallFormat =
+                chatStamped
+                ?? jangStamped
                 ?? ToolCallFormat.infer(from: baseConfig.modelType)
         }
 
@@ -730,27 +911,25 @@ public final class LLMModelFactory: GenericModelFactory {
         // stamp is the short capability name (e.g. `"qwen3_6"`, `"gemma4"`);
         // Evaluate + BatchEngine resolve it to a live ReasoningParser
         // instance via `ReasoningParser.fromCapabilityName(_:)`.
+        //
+        // CORRECTNESS CRITICAL: historically this was a reverse-allowlist
+        // that defaulted ANY model_type outside {gemma4, gemma, mistral}
+        // to `"think_xml"`. `think_xml` starts with `startInReasoning: true`
+        // to match Qwen's `<think>`-prefilled prompt tail — so for every
+        // non-reasoning family (LFM2, LLaMA, Phi, StarCoder2, Cohere,
+        // OpenELM, InternLM2, GPT-OSS, NanoChat, …) every decoded chunk
+        // came out as `Generation.reasoning(_)` and osaurus rendered the
+        // entire answer into the thinking block. Fixed by flipping to an
+        // explicit allowlist of the model_types that ACTUALLY emit a
+        // `<think>…</think>` envelope natively (Qwen 3.x, DeepSeek-V3/V4,
+        // GLM 4/5, MiniMax M2+, Kimi K2.x, Nemotron-H). Every other
+        // model_type falls through to `"none"` and emits plain `.chunk`.
         if mutableConfiguration.reasoningParserName == nil {
             if let stamp = jangConfig?.capabilities?.reasoningParser {
                 mutableConfiguration.reasoningParserName = stamp
             } else {
-                // Heuristic: families that emit `<think>...</think>` natively,
-                // vs. Gemma-4's harmony-channel envelope
-                // (`<|channel>thought\n…<channel|>`), vs. plain models with
-                // no reasoning tags.
-                //
-                // Matches the ParserResolution facade but flattened to a
-                // canonical stamp string so we keep a single code path
-                // through the handler.
-                let t = baseConfig.modelType.lowercased()
-                if t.hasPrefix("gemma4") {
-                    mutableConfiguration.reasoningParserName = "harmony"
-                } else if t.hasPrefix("mistral") || t.hasPrefix("gemma") {
-                    // Gemma 3 / 3n / Mistral: no reasoning envelope.
-                    mutableConfiguration.reasoningParserName = "none"
-                } else {
-                    mutableConfiguration.reasoningParserName = "think_xml"
-                }
+                mutableConfiguration.reasoningParserName =
+                    reasoningStampFromModelType(baseConfig.modelType)
             }
         }
 
@@ -774,8 +953,13 @@ public final class LLMModelFactory: GenericModelFactory {
         // When JANG, skip config.json's perLayerQuantization — JANG infers correct
         // per-layer bits from tensor shapes. This avoids creating QuantizedLinear at
         // the wrong bit width (which can't be re-quantized later).
+        // BUT: still pass `quantization` (the global config.json group_size /
+        // bits) so JangLoader.inferPerLayerQuantization gets the correct
+        // `knownGroupSize` even when jang_config.json doesn't carry quant
+        // metadata (e.g. DSV4-Flash bundles ship `weight_format: "bf16"`).
         try loadWeights(
             modelDirectory: modelDirectory, model: model,
+            quantization: jangConfig != nil ? baseConfig.quantization : nil,
             perLayerQuantization: jangConfig != nil ? nil : baseConfig.perLayerQuantization,
             jangConfig: jangConfig)
 

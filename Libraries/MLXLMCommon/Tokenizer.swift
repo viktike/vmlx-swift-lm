@@ -95,12 +95,70 @@ public struct NaiveStreamingDetokenizer: StreamingDetokenizer {
 
     public mutating func next() -> String? {
         let newSegment = tokenizer.decode(tokenIds: segmentTokens)
+
+        // Decode can produce a SHORTER string than the previous segment
+        // when the tokenizer's stateful reassembly reinterprets earlier
+        // tokens — e.g. `cleanUpTokenizationSpaces` substitutions
+        // (" 's" → "'s", " ." → "."), byte-level BPE completing a
+        // multi-byte UTF-8 grapheme that previously rendered as one or
+        // more `\u{fffd}` replacements, or two adjacent specials
+        // collapsing to a shorter rendered marker. Passing a negative
+        // length to `String.suffix(_:)` traps with
+        //   "Can't take a suffix of negative length from a collection"
+        // which surfaces as a Swift `_assertionFailure` on the
+        // generate()-pipeline Task (reproduced via
+        // `NaiveStreamingDetokenizerShrinkTests`). Reconcile our
+        // baseline and yield nothing for this step — the detokenizer
+        // remains usable for future `append(token:)` calls.
+        guard newSegment.count >= segment.count else {
+            self.segment = newSegment
+            return nil
+        }
+
         let new = newSegment.suffix(newSegment.count - segment.count)
 
         // if the new segment ends with REPLACEMENT CHARACTER this means
         // that the token didn't produce a complete unicode character
         if new.last == "\u{fffd}" {
             return nil
+        }
+
+        // Defer mid-grapheme-cluster emits so streaming output never
+        // splits a multi-codepoint emoji (regional-indicator pairs for
+        // flags, ZWJ sequences for compound emoji, base+variation-
+        // selector pairs). Without this guard, e.g. `🇺🇸` (US flag =
+        // U+1F1FA + U+1F1F8) streams as two separate broken-box
+        // glyphs — confirmed user-visible 2026-04-24 with
+        // MiniMax-M2.7-Small JANGTQ rendering an emitted flag as
+        // `❓国旗` in osaurus.
+        //
+        // Inspect the LAST grapheme cluster of `new` rather than its
+        // last scalar — Swift treats `🇺🇸` as one grapheme even when
+        // the character has two regional-indicator scalars, so a raw
+        // scalar check would defer the completed flag forever.
+        // Triggers:
+        //   • Last grapheme is a single unpaired regional indicator
+        //     (count == 1 within range 0x1F1E6 - 0x1F1FF) → wait for
+        //     the sibling that completes the flag.
+        //   • Last scalar of last grapheme is ZWJ (U+200D) → the
+        //     ZWJ-emoji chain is mid-build; wait for the next codepoint.
+        //   • Trailing high surrogate (rare in Swift String, but
+        //     harmless to defer if it ever appears).
+        if let lastChar = new.last {
+            let scalars = Array(lastChar.unicodeScalars)
+            if let lastScalarValue = scalars.last?.value {
+                let isUnpairedRegionalIndicator =
+                    scalars.count == 1
+                    && (0x1F1E6...0x1F1FF).contains(lastScalarValue)
+                let endsWithZWJ = lastScalarValue == 0x200D
+                let endsWithHighSurrogate =
+                    (0xD800...0xDBFF).contains(lastScalarValue)
+                if isUnpairedRegionalIndicator || endsWithZWJ
+                    || endsWithHighSurrogate
+                {
+                    return nil
+                }
+            }
         }
 
         if new.hasSuffix("\n") {

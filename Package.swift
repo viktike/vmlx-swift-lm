@@ -38,7 +38,17 @@ let package = Package(
     dependencies: [
         .package(url: "https://github.com/osaurus-ai/mlx-swift", branch: "osaurus-0.31.3"),
         .package(url: "https://github.com/swiftlang/swift-syntax.git", from: "600.0.0-latest"),
-        .package(url: "https://github.com/huggingface/swift-transformers", from: "0.1.21"),
+        // swift-transformers 1.0.0+ transitively uses huggingface/
+        // swift-jinja 2.x which already contains the three root-cause
+        // fixes we previously carried in the osaurus-ai/Jinja 1.3.1
+        // fork (Gemma-4 lexer `{{%` ambiguity, dict-iter single-
+        // identifier binding, standalone SelectExpression). See
+        // `Libraries/MLXLMCommon/ChatTemplates/swift-jinja-patches/`
+        // for the root-cause writeup. Fork is now archival reference
+        // only; `ChatTemplateFallbacks.swift` + `TokenizerBridge`
+        // auto-engage remain as the defensive safety net if a FUTURE
+        // swift-jinja release ever regresses on a new template family.
+        .package(url: "https://github.com/huggingface/swift-transformers", from: "1.0.0"),
     ],
     targets: [
         .target(
@@ -130,10 +140,12 @@ let package = Package(
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXOptimizers", package: "mlx-swift"),
+                .product(name: "Transformers", package: "swift-transformers"),
                 "MLXLMCommon",
                 "MLXLLM",
                 "MLXVLM",
                 "MLXEmbedders",
+                "MLXHuggingFace",
             ],
             path: "Tests/MLXLMTests",
             exclude: [

@@ -266,33 +266,22 @@ public enum ParserResolution {
                 .jangStamped
             )
         }
-        // Heuristic by model_type. We treat most model types as
-        // `<think>`-family and return a parser tuned for that. Gemma 4
-        // uses a different wire format (harmony channel envelope) and
-        // gets a dedicated parser. Gemma 3 / 3n and Mistral have no
-        // reasoning envelope.
-        guard let modelType, !modelType.isEmpty else {
-            return (nil, .none)
+        // Heuristic: delegate to the canonical factory helper so this
+        // stays byte-identical with `LLMModelFactory` / `VLMModelFactory`.
+        // Historical note: this function previously carried its own
+        // reverse-allowlist default that returned a live `ReasoningParser()`
+        // for every non-{gemma,mistral} model_type, which drove the LFM2
+        // "entire answer routed to .reasoning" bug. Never reintroduce a
+        // local default here; `reasoningStampFromModelType` is the sole
+        // source of truth.
+        let stamp = reasoningStampFromModelType(modelType)
+        if stamp == "none" {
+            return (nil, modelType?.isEmpty == false ? .modelTypeHeuristic : .none)
         }
-        let t = modelType.lowercased()
-        if t.hasPrefix("gemma4") {
-            return (
-                ReasoningParser.fromCapabilityName("harmony"),
-                .modelTypeHeuristic
-            )
-        }
-        if t.hasPrefix("mistral") || t.hasPrefix("gemma") {
-            return (nil, .modelTypeHeuristic)
-        }
-        // The `<think>…</think>` family — Qwen 3.5 / 3.6, DeepSeek-R1,
-        // GLM 4.x, Nemotron. The default parser returned here starts in
-        // content mode to preserve byte-for-byte compatibility with the
-        // previous behaviour; Evaluate / BatchEngine resolve the
-        // `think_xml` capability stamp themselves via
-        // `ReasoningParser.fromCapabilityName` (which now returns a
-        // parser with `startInReasoning=true` to handle the Qwen 3.6
-        // enable_thinking=true prefill case).
-        return (ReasoningParser(), .modelTypeHeuristic)
+        return (
+            ReasoningParser.fromCapabilityName(stamp),
+            .modelTypeHeuristic
+        )
     }
 
     /// Resolve a `ToolCallFormat` for a model.
@@ -372,6 +361,148 @@ public enum ParserResolution {
 }
 
 /// Parsed JANG model configuration from jang_config.json.
+/// Reasoning-mode hint block from `jang_config.json -> chat.reasoning`.
+///
+/// Per `jang/research/DSV-FAMILY-RUNTIME-GUIDE.md` §23 + §25, DSV4
+/// bundles ship explicit reasoning-mode metadata:
+///
+///   - `modes`: which modes the model supports (e.g. `["chat", "thinking"]`)
+///   - `default_mode`: which mode to use if the caller doesn't pick one
+///   - `thinking_start` / `thinking_end`: the envelope tags the
+///     runtime should watch for (e.g. `<think>` / `</think>`)
+///   - `reasoning_effort_levels`: allowed `reasoning_effort` knob
+///     values (e.g. `["max", "high", nil]`)
+///   - `drop_earlier_reasoning`: whether multi-turn chat should
+///     strip earlier assistant reasoning before re-encoding
+///
+/// DSV4 is the first family that splits reasoning into a `"chat"`
+/// mode (prompt ends with a CLOSED `</think>` empty block — parser
+/// must start with `startInReasoning: false`) and a `"thinking"`
+/// mode (prompt ends with an OPEN `<think>` — parser starts inside
+/// reasoning). `ReasoningParser.forPrompt(stampName:promptTail:)`
+/// already handles tail detection, but consumers need this struct
+/// to know the default mode + allowed options.
+public struct JangChatReasoning: Sendable, Equatable {
+    public let supported: Bool?
+    public let modes: [String]?
+    public let defaultMode: String?
+    public let thinkingStart: String?
+    public let thinkingEnd: String?
+    public let reasoningEffortLevels: [String?]?
+    public let dropEarlierReasoning: Bool?
+
+    public init(
+        supported: Bool? = nil,
+        modes: [String]? = nil,
+        defaultMode: String? = nil,
+        thinkingStart: String? = nil,
+        thinkingEnd: String? = nil,
+        reasoningEffortLevels: [String?]? = nil,
+        dropEarlierReasoning: Bool? = nil
+    ) {
+        self.supported = supported
+        self.modes = modes
+        self.defaultMode = defaultMode
+        self.thinkingStart = thinkingStart
+        self.thinkingEnd = thinkingEnd
+        self.reasoningEffortLevels = reasoningEffortLevels
+        self.dropEarlierReasoning = dropEarlierReasoning
+    }
+}
+
+/// Tool-calling hint block from `jang_config.json -> chat.tool_calling`.
+/// DSV4 stamps `parser = "dsml"` + the DSML markup token; other
+/// families may stamp parser names like `"xml_function"` or
+/// `"kimi_k2"` that round-trip through
+/// `ToolCallFormat.fromCapabilityName`.
+public struct JangChatToolCalling: Sendable, Equatable {
+    public let supported: Bool?
+    public let parser: String?
+    public let dsmlToken: String?
+    public let toolCallsBlock: String?
+    public let invokeBlock: String?
+    public let parameterBlock: String?
+    public let toolOutputTag: String?
+
+    public init(
+        supported: Bool? = nil,
+        parser: String? = nil,
+        dsmlToken: String? = nil,
+        toolCallsBlock: String? = nil,
+        invokeBlock: String? = nil,
+        parameterBlock: String? = nil,
+        toolOutputTag: String? = nil
+    ) {
+        self.supported = supported
+        self.parser = parser
+        self.dsmlToken = dsmlToken
+        self.toolCallsBlock = toolCallsBlock
+        self.invokeBlock = invokeBlock
+        self.parameterBlock = parameterBlock
+        self.toolOutputTag = toolOutputTag
+    }
+}
+
+/// Sampling defaults from `jang_config.json -> chat.sampling_defaults`.
+/// Consumers (BatchEngine / Evaluate) may apply these when the
+/// caller doesn't pass explicit sampler params. DSV4-Flash recommends
+/// `temperature=0.6, top_p=0.95, max_new_tokens=300`.
+public struct JangChatSamplingDefaults: Sendable, Equatable {
+    public let temperature: Float?
+    public let topP: Float?
+    public let maxNewTokens: Int?
+
+    public init(
+        temperature: Float? = nil, topP: Float? = nil, maxNewTokens: Int? = nil
+    ) {
+        self.temperature = temperature
+        self.topP = topP
+        self.maxNewTokens = maxNewTokens
+    }
+}
+
+/// Top-level `jang_config.json -> chat` block. Aggregates reasoning
+/// + tool-calling + sampling hints the runtime applies when
+/// building prompts and configuring generation. Populated only
+/// when the bundle carries the new DSV4-era schema; older bundles
+/// fall back to `capabilities` + model_type heuristics.
+public struct JangChatConfig: Sendable, Equatable {
+    public let encoder: String?
+    public let hasTokenizerChatTemplate: Bool?
+    public let bosToken: String?
+    public let bosTokenId: Int?
+    public let eosToken: String?
+    public let eosTokenId: Int?
+    public let roleTokens: [String: String]?
+    public let reasoning: JangChatReasoning?
+    public let toolCalling: JangChatToolCalling?
+    public let samplingDefaults: JangChatSamplingDefaults?
+
+    public init(
+        encoder: String? = nil,
+        hasTokenizerChatTemplate: Bool? = nil,
+        bosToken: String? = nil,
+        bosTokenId: Int? = nil,
+        eosToken: String? = nil,
+        eosTokenId: Int? = nil,
+        roleTokens: [String: String]? = nil,
+        reasoning: JangChatReasoning? = nil,
+        toolCalling: JangChatToolCalling? = nil,
+        samplingDefaults: JangChatSamplingDefaults? = nil
+    ) {
+        self.encoder = encoder
+        self.hasTokenizerChatTemplate = hasTokenizerChatTemplate
+        self.bosToken = bosToken
+        self.bosTokenId = bosTokenId
+        self.eosToken = eosToken
+        self.eosTokenId = eosTokenId
+        self.roleTokens = roleTokens
+        self.reasoning = reasoning
+        self.toolCalling = toolCalling
+        self.samplingDefaults = samplingDefaults
+    }
+}
+
 public struct JangConfig: Sendable {
     public let format: String
     public let formatVersion: String
@@ -386,6 +517,18 @@ public struct JangConfig: Sendable {
     /// heuristics.
     public let capabilities: JangCapabilities?
 
+    /// Top-level `model_family` hint (new in DSV4-era jang_config —
+    /// e.g. `"deepseek_v4"`, `"kimi_k26"`). Complements
+    /// `capabilities.family` which is a UI / registry grouping;
+    /// `modelFamily` is used by runtime chat-encoder dispatch.
+    public let modelFamily: String?
+
+    /// Optional `chat.*` block — present on DSV4-era bundles with
+    /// explicit reasoning modes + tool-parser stamps + sampling
+    /// defaults. `nil` on older bundles; consumers fall back to
+    /// `capabilities` + model_type heuristics.
+    public let chat: JangChatConfig?
+
     public init(
         format: String = "jang",
         formatVersion: String = "2.0",
@@ -393,7 +536,9 @@ public struct JangConfig: Sendable {
         sourceModel: JangSourceModel = JangSourceModel(),
         architecture: JangArchitecture = JangArchitecture(),
         runtime: JangRuntime = JangRuntime(),
-        capabilities: JangCapabilities? = nil
+        capabilities: JangCapabilities? = nil,
+        modelFamily: String? = nil,
+        chat: JangChatConfig? = nil
     ) {
         self.format = format
         self.formatVersion = formatVersion
@@ -402,6 +547,8 @@ public struct JangConfig: Sendable {
         self.architecture = architecture
         self.runtime = runtime
         self.capabilities = capabilities
+        self.modelFamily = modelFamily
+        self.chat = chat
     }
 }
 
@@ -758,6 +905,75 @@ public struct JangLoader: Sendable {
             capabilities = nil
         }
 
+        // Top-level `model_family` hint (DSV4-era). Fallback to
+        // `capabilities.family` for older bundles that carry family
+        // under the capabilities block.
+        let modelFamily =
+            (json["model_family"] as? String) ?? capabilities?.family
+
+        // New `chat` block — see JangChatConfig doc. Only present
+        // on DSV4-era bundles; older bundles return nil here and
+        // the runtime falls back to `capabilities` + model_type
+        // heuristics. Parsed defensively (every field optional) so
+        // partial adoption doesn't break loaders.
+        let chat: JangChatConfig?
+        if let chDict = json["chat"] as? [String: Any] {
+            // reasoning subblock
+            let reasoning: JangChatReasoning?
+            if let rDict = chDict["reasoning"] as? [String: Any] {
+                reasoning = JangChatReasoning(
+                    supported: rDict["supported"] as? Bool,
+                    modes: rDict["modes"] as? [String],
+                    defaultMode: rDict["default_mode"] as? String,
+                    thinkingStart: rDict["thinking_start"] as? String,
+                    thinkingEnd: rDict["thinking_end"] as? String,
+                    reasoningEffortLevels: parseEffortLevels(
+                        rDict["reasoning_effort_levels"]),
+                    dropEarlierReasoning: rDict["drop_earlier_reasoning"] as? Bool
+                )
+            } else { reasoning = nil }
+
+            // tool_calling subblock
+            let toolCalling: JangChatToolCalling?
+            if let tDict = chDict["tool_calling"] as? [String: Any] {
+                toolCalling = JangChatToolCalling(
+                    supported: tDict["supported"] as? Bool,
+                    parser: tDict["parser"] as? String,
+                    dsmlToken: tDict["dsml_token"] as? String,
+                    toolCallsBlock: tDict["tool_calls_block"] as? String,
+                    invokeBlock: tDict["invoke_block"] as? String,
+                    parameterBlock: tDict["parameter_block"] as? String,
+                    toolOutputTag: tDict["tool_output_tag"] as? String
+                )
+            } else { toolCalling = nil }
+
+            // sampling_defaults subblock
+            let sampling: JangChatSamplingDefaults?
+            if let sDict = chDict["sampling_defaults"] as? [String: Any] {
+                sampling = JangChatSamplingDefaults(
+                    temperature: floatValue(sDict["temperature"]),
+                    topP: floatValue(sDict["top_p"]),
+                    maxNewTokens: sDict["max_new_tokens"] as? Int
+                )
+            } else { sampling = nil }
+
+            chat = JangChatConfig(
+                encoder: chDict["encoder"] as? String,
+                hasTokenizerChatTemplate:
+                    chDict["has_tokenizer_chat_template"] as? Bool,
+                bosToken: chDict["bos_token"] as? String,
+                bosTokenId: chDict["bos_token_id"] as? Int,
+                eosToken: chDict["eos_token"] as? String,
+                eosTokenId: chDict["eos_token_id"] as? Int,
+                roleTokens: chDict["role_tokens"] as? [String: String],
+                reasoning: reasoning,
+                toolCalling: toolCalling,
+                samplingDefaults: sampling
+            )
+        } else {
+            chat = nil
+        }
+
         return JangConfig(
             format: format,
             formatVersion: formatVersion,
@@ -765,8 +981,21 @@ public struct JangLoader: Sendable {
             sourceModel: sourceModel,
             architecture: architecture,
             runtime: runtime,
-            capabilities: capabilities
+            capabilities: capabilities,
+            modelFamily: modelFamily,
+            chat: chat
         )
+    }
+
+    /// `reasoning_effort_levels` may contain `null` entries — the
+    /// converter encodes "no effort override" as JSON null. Map them
+    /// to Swift `nil` while preserving strings like `"max"` / `"high"`.
+    private static func parseEffortLevels(_ raw: Any?) -> [String?]? {
+        guard let arr = raw as? [Any] else { return nil }
+        return arr.map { item in
+            if item is NSNull { return nil }
+            return item as? String
+        }
     }
 
     // MARK: - Per-Layer Bit Width Inference
@@ -780,9 +1009,16 @@ public struct JangLoader: Sendable {
     /// `loadWeights()` quantization path can use directly.
     public static func inferPerLayerQuantization(
         weights: [String: MLXArray],
-        jangConfig: JangConfig
+        jangConfig: JangConfig,
+        overrideGroupSize: Int? = nil
     ) -> BaseConfiguration.PerLayerQuantization {
-        let groupSize = jangConfig.quantization.blockSize
+        // Prefer the caller-supplied group_size (typically from
+        // config.json's quantization.group_size) over jangConfig's
+        // default blockSize. Bundles whose jang_config.json doesn't
+        // carry explicit quant metadata (e.g., DSV4-Flash JANG_2L
+        // ships `weight_format: "bf16"`) need the config.json value
+        // to land at the right group_size during shape inference.
+        let groupSize = overrideGroupSize ?? jangConfig.quantization.blockSize
         var perLayer = [String: BaseConfiguration.QuantizationOption]()
 
         // Find the default (most common) bit width from jang_config
@@ -888,11 +1124,19 @@ public struct JangLoader: Sendable {
         let candidates = bitWidthsUsed.isEmpty
             ? validBits.sorted(by: >)  // [8, 6, 5, 4, 3, 2]
             : bitWidthsUsed.sorted(by: >)
+        // MLX's quantize op only accepts group_size ∈ {32, 64, 128}.
+        // A shape-only fallback search can otherwise return e.g.
+        // (bits=8, gs=8) or (bits=4, gs=16) which then fatal-errors
+        // inside `mlx::quantize`. Filter to the supported set up front
+        // — the next candidate `bits` will pick a valid gs (verified
+        // on DSV4-Flash JANG_2L: bits=2 → inDim=4096 → gs=32 ✓).
+        let mlxValidGroupSizes: Set<Int> = [32, 64, 128]
         for bits in candidates {
             guard bits > 0, (packedDim * 32) % bits == 0 else { continue }
             let inDim = (packedDim * 32) / bits
             guard inDim > 0, inDim % numGroups == 0 else { continue }
             let gs = inDim / numGroups
+            guard mlxValidGroupSizes.contains(gs) else { continue }
             return (bits, gs)
         }
 

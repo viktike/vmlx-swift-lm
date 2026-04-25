@@ -150,7 +150,12 @@ public struct ReasoningParser: Sendable {
             // a tag prefix at the end, hold back enough characters that a
             // future chunk can complete it.
             if allowPartialTagAtEnd {
-                let safeTail = max(startTag.count, endTag.count) - 1
+                // `max(startTag, endTag).count - 1` — use `max(0, …)` so
+                // an edge-case empty tag (e.g. a model-specific override
+                // mis-configured at init) doesn't produce a negative
+                // `safeTail`, which would make the `offsetBy: -safeTail`
+                // move forward past `endIndex` and trap in the stdlib.
+                let safeTail = max(0, max(startTag.count, endTag.count) - 1)
                 if buffer.count > safeTail {
                     let splitAt = buffer.index(buffer.endIndex, offsetBy: -safeTail)
                     let safe = String(buffer[..<splitAt])
@@ -210,7 +215,8 @@ extension ReasoningParser {
         switch name.lowercased() {
         case "think_xml", "qwen3", "qwen3_5", "qwen35", "qwen3_6", "qwen36",
             "deepseek_r1", "deepseek-r1", "deepseek", "glm", "glm4", "glm5",
-            "nemotron", "nemotron_h", "minimax", "minimax_m2":
+            "nemotron", "nemotron_h", "minimax", "minimax_m2",
+            "kimi", "kimi_k2", "kimik2":
             // Start inside the reasoning block — matches the Qwen 3.x
             // family's chat-template default (`enable_thinking=true`
             // prefills `<think>\n` at prompt tail).
@@ -290,10 +296,19 @@ extension ReasoningParser {
             // Closer with no opener → prompt ends in content.
             startInReasoning = false
         case (nil, nil):
-            // Neither tag seen in the tail — trust stamp default.
-            // Reconstruct the parser with its stamp-inferred initial
-            // state by re-calling fromCapabilityName.
-            return base
+            // Neither opener nor closer in the prompt tail. The stamps
+            // that bake `startInReasoning=true` (think_xml / qwen family)
+            // do so to match chat templates that PREFILL `<think>` at
+            // the prompt tail. If the tail is missing that opener
+            // entirely, the template didn't prefill — e.g. the model
+            // is mis-stamped, or an upstream consumer built its own
+            // prompt. Starting in reasoning in that case routes the
+            // entire answer into `.reasoning` which osaurus renders in
+            // the thinking block (reported 2026-04-24 for LFM2 bundles
+            // with stale stamps). Safer default: start in content; the
+            // parser still latches on `<think>` mid-stream if the model
+            // emits one, so Qwen 3.6 interleaved thinking still works.
+            startInReasoning = false
         }
 
         return ReasoningParser(
@@ -333,4 +348,70 @@ extension ReasoningParser {
         }
         return (reasoning, content)
     }
+}
+
+// MARK: - model_type → reasoning stamp (factory helper)
+
+/// Pick a reasoning-parser stamp for a given `model_type` when the
+/// JANG `capabilities.reasoning_parser` hint is absent. EXPLICIT
+/// ALLOWLIST — every model_type not listed here falls through to
+/// `"none"` (no reasoning parsing).
+///
+/// Historical note: both LLMModelFactory and VLMModelFactory used a
+/// reverse-allowlist that defaulted everything outside
+/// `{gemma4, gemma, mistral}` to `"think_xml"`. That parser starts
+/// with `startInReasoning: true` to match Qwen's `<think>`-prefilled
+/// prompt tail, so any model_type that DOESN'T emit a think envelope
+/// (LFM2, LLaMA, Phi, StarCoder2, Cohere, OpenELM, InternLM2,
+/// GPT-OSS, NanoChat, …) had its entire answer routed to
+/// `Generation.reasoning(_)` and osaurus rendered it all in the
+/// thinking block. Reported by osaurus user 2026-04-24 on LFM2.
+///
+/// Tests: `ReasoningStampFromModelTypeTests` + per-family
+/// regressions in `ReasoningParserTests`.
+///
+/// - Parameter modelType: The raw `model_type` value from
+///   `config.json`. Case-insensitive; empty / nil → `"none"`.
+/// - Returns: A capability-name stamp that
+///   `ReasoningParser.fromCapabilityName(_:)` understands. Never
+///   `nil`; callers pass the returned string through to the parser.
+public func reasoningStampFromModelType(_ modelType: String?) -> String {
+    guard let modelType, !modelType.isEmpty else { return "none" }
+    let t = modelType.lowercased()
+
+    // Gemma-4 harmony channel envelope: `<|channel>thought\n…<channel|>`.
+    // Distinct from `<think>` XML.
+    if t.hasPrefix("gemma4") {
+        return "harmony"
+    }
+
+    // Explicit allowlist of model families that emit `<think>` /
+    // `</think>` in their native chat template. These all resolve
+    // via `ReasoningParser.fromCapabilityName` to the think_xml
+    // parser.
+    //
+    // Checked as prefix matches so minor-version variants (qwen3_6,
+    // qwen3_next_moe, deepseek_v4, kimi_k25, etc.) flow through to
+    // the same stamp without an explicit entry each.
+    let thinkXmlPrefixes = [
+        "qwen3",        // qwen3, qwen3_5, qwen3_6, qwen3_moe, qwen3_next
+        "deepseek",     // deepseek_v3, deepseek_v4, deepseek_r1
+        "glm4_moe",     // glm4_moe, glm4_moe_lite
+        "glm5",         // glm5 family
+        "minimax",      // minimax, minimax_m2, minimax_m3
+        "kimi",         // kimi_k2, kimi_k25
+        "nemotron_h",   // NemotronH / Cascade series
+        "holo",         // Holo3 variants
+    ]
+    if thinkXmlPrefixes.contains(where: t.hasPrefix) {
+        return "think_xml"
+    }
+
+    // Default: no reasoning envelope. Output flows as plain `.chunk`
+    // events with zero `.reasoning` leakage. Covers LFM2, LLaMA,
+    // Phi 3/MoE, StarCoder2, Cohere, OpenELM, InternLM2, GPT-OSS,
+    // NanoChat, BitNet, Mistral 3/4, Gemma 2/3/3n, plus any new
+    // model_type that lands in LLMModelFactory without an explicit
+    // reasoning stamp.
+    return "none"
 }
