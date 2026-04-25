@@ -61,8 +61,8 @@ public final class ModelContainer: Sendable {
 
     /// Enable caching with auto-detection of hybrid models.
     /// Call after model loading. Inspects the model's cache types to detect SSM layers.
-    public func enableCachingAsync() async {
-        var config = CacheCoordinatorConfig()
+    public func enableCachingAsync(config: CacheCoordinatorConfig = CacheCoordinatorConfig()) async {
+        var config = config
         let modelConfig = await context.read { $0.configuration }
         config.modelKey = modelConfig.name
 
