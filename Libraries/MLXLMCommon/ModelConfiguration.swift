@@ -107,18 +107,41 @@ public struct ModelConfiguration: Sendable {
     /// Tool call format for this model (nil = default JSON format)
     public var toolCallFormat: ToolCallFormat?
 
+    /// Reasoning-parser capability stamp for this model.
+    ///
+    /// When set, `TextToolTokenLoopHandler` / `BatchEngine.generate()` construct
+    /// a `ReasoningParser` and pipeline each decoded chunk through it *before*
+    /// the tool-call processor so `<think>...</think>` content is stripped
+    /// from user-visible `.chunk(String)` events.
+    ///
+    /// Accepted values match `ReasoningParser.fromCapabilityName(_:)`:
+    /// - `"think_xml"`, `"qwen3"`, `"qwen3_5"`, `"qwen3_6"`, `"deepseek_r1"`,
+    ///   `"glm4"`, `"nemotron"`, `"minimax"` → strip `<think>...</think>`.
+    ///   These stamps use `startInReasoning=true` because the Qwen 3.x
+    ///   chat templates prefill `<think>\n` at prompt tail when
+    ///   `enable_thinking=true` (the template default).
+    /// - `"harmony"` / `"harmony_channel"` / `"gemma4_channel"` /
+    ///   `"gemma4"` → strip `<|channel>thought\n...<channel|>` (Gemma-4
+    ///   harmony-channel envelope).
+    /// - `"none"`, `"mistral"`, `"gemma"` → no stripping (these families
+    ///   emit no reasoning envelope at inference time).
+    /// - `nil` → no stripping (byte-compatible with upstream default).
+    public var reasoningParserName: String?
+
     public init(
         id: String, revision: String = "main",
         tokenizerSource: TokenizerSource? = nil,
         defaultPrompt: String = "",
         extraEOSTokens: Set<String> = [],
-        toolCallFormat: ToolCallFormat? = nil
+        toolCallFormat: ToolCallFormat? = nil,
+        reasoningParserName: String? = nil
     ) {
         self.id = .id(id, revision: revision)
         self.tokenizerSource = tokenizerSource
         self.defaultPrompt = defaultPrompt
         self.extraEOSTokens = extraEOSTokens
         self.toolCallFormat = toolCallFormat
+        self.reasoningParserName = reasoningParserName
     }
 
     public init(
@@ -127,7 +150,8 @@ public struct ModelConfiguration: Sendable {
         defaultPrompt: String = "",
         extraEOSTokens: Set<String> = [],
         eosTokenIds: Set<Int> = [],
-        toolCallFormat: ToolCallFormat? = nil
+        toolCallFormat: ToolCallFormat? = nil,
+        reasoningParserName: String? = nil
     ) {
         self.id = .directory(directory)
         self.tokenizerSource = tokenizerSource
@@ -135,6 +159,7 @@ public struct ModelConfiguration: Sendable {
         self.extraEOSTokens = extraEOSTokens
         self.eosTokenIds = eosTokenIds
         self.toolCallFormat = toolCallFormat
+        self.reasoningParserName = reasoningParserName
     }
 
     /// Maps this configuration's behavioral properties into a
@@ -152,7 +177,8 @@ public struct ModelConfiguration: Sendable {
             defaultPrompt: defaultPrompt,
             extraEOSTokens: extraEOSTokens,
             eosTokenIds: eosTokenIds,
-            toolCallFormat: toolCallFormat)
+            toolCallFormat: toolCallFormat,
+            reasoningParserName: reasoningParserName)
     }
 
 }

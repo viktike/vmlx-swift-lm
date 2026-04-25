@@ -136,6 +136,7 @@ public class ToolCallProcessor {
 
             // No brace seen — pass through as regular text
             return chunk
+
         case .potentialToolCall, .collectingToolCall:
             toolCallBuffer += chunk
 
@@ -158,6 +159,7 @@ public class ToolCallProcessor {
             return nil
         }
     }
+
     /// Check whether open/close braces are balanced in the string.
     private func jsonBracesBalanced(_ text: String) -> Bool {
         var depth = 0

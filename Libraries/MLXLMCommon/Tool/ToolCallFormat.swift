@@ -146,12 +146,14 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     ///
     /// - Parameters:
     ///   - modelType: The `model_type` value from config.json
-    ///   - configData: The raw config.json data for inspecting secondary signals (e.g. `rope_scaling` for Llama 3)
+    ///   - configData: The raw config.json data for inspecting secondary signals
+    ///     (e.g. `rope_scaling` / `vocab_size` for Llama 3 vs Llama 2).
     /// - Returns: The appropriate `ToolCallFormat`, or `nil` to use the default format
     public static func infer(from modelType: String, configData: Data? = nil) -> ToolCallFormat? {
         let type = modelType.lowercased()
 
-        // Llama family (need secondary signal for Llama 3 vs 1/2)
+        // Llama family (need secondary signal for Llama 3 vs 1/2).
+        // Kept byte-compatible with upstream ml-explore/mlx-swift-lm.
         if type == "llama" {
             guard let data = configData,
                 let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
@@ -254,7 +256,10 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         case "minimax", "minimax_m2_5":
             return .minimaxM2
         // GLM 4.x / 5 / DeepSeek tool format (arg_key / arg_value tags).
-        case "glm47", "glm5", "glm4_moe", "deepseek", "glm4v":
+        // `glm4` is also the canonical rawValue and already matches via
+        // the direct lookup above, but is listed here for parity with
+        // `glm4_moe` / `glm47` family aliases.
+        case "glm4", "glm47", "glm5", "glm4_moe", "deepseek", "glm4v":
             return .glm4
         // Nemotron-H / Cascade — same XML-style envelope as Qwen3 Coder.
         // Our `XMLFunctionParser` handles `<tool_call><function=name>…`

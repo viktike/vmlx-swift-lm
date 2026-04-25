@@ -54,16 +54,33 @@ public struct JangQuantization: Sendable, Equatable {
 /// Source model info from jang_config.json `source_model` block.
 public struct JangSourceModel: Sendable, Equatable {
     public let name: String
+    public let org: String
+    public let architecture: String
     public let dtype: String
     public let parameters: String
 
-    public init(name: String = "", dtype: String = "bfloat16", parameters: String = "0") {
+    public init(
+        name: String = "",
+        org: String = "",
+        architecture: String = "",
+        dtype: String = "bfloat16",
+        parameters: String = "0"
+    ) {
         self.name = name
+        self.org = org
+        self.architecture = architecture
         self.dtype = dtype
         self.parameters = parameters
     }
 
     public var parameterCount: Int { Int(parameters) ?? 0 }
+
+    /// HuggingFace canonical repo id, e.g. `MiniMaxAI/MiniMax-M2.7`. Empty if
+    /// either `org` or `name` is missing.
+    public var huggingFaceRepoID: String {
+        guard !org.isEmpty, !name.isEmpty else { return "" }
+        return "\(org)/\(name)"
+    }
 }
 
 /// Architecture info from jang_config.json `architecture` block.
@@ -148,6 +165,29 @@ public struct JangCapabilities: Sendable {
     /// KV for MLA models).
     public let cacheType: String?
 
+    /// Speculative-decoding strategy the JANG bundle ships alongside
+    /// this target. Known values: `dflash`, `ddtree`, `autoregressive`,
+    /// `none`. `nil` means the bundle does not ship a compatible
+    /// drafter. Maps to ``DraftStrategy`` via
+    /// ``ParserResolution/draftStrategy(capabilities:modelDirectory:)``.
+    public let draftStrategy: String?
+
+    /// Path to the drafter checkpoint, RELATIVE to `jang_config.json`.
+    /// Typical value: `"drafter/"` (i.e. a subdirectory next to the
+    /// target weights). `nil` when `draftStrategy` is absent or `none`.
+    public let drafterPath: String?
+
+    /// Branching budget for ``DraftStrategy/ddtree(drafterPath:branchingBudget:blockSize:)``.
+    /// Paper recommends 32-64 for greedy, 16-24 for sampling. `nil`
+    /// when `draftStrategy != "ddtree"`.
+    public let branchingBudget: Int?
+
+    /// Block size the drafter was trained with — must match
+    /// `config.json["block_size"]` inside the drafter snapshot. When
+    /// present, callers use this to satisfy
+    /// ``DraftStrategy/dflash(drafterPath:blockSize:)`` etc.
+    public let blockSize: Int?
+
     public init(
         reasoningParser: String? = nil,
         toolParser: String? = nil,
@@ -156,7 +196,11 @@ public struct JangCapabilities: Sendable {
         supportsThinking: Bool? = nil,
         family: String? = nil,
         modality: String? = nil,
-        cacheType: String? = nil
+        cacheType: String? = nil,
+        draftStrategy: String? = nil,
+        drafterPath: String? = nil,
+        branchingBudget: Int? = nil,
+        blockSize: Int? = nil
     ) {
         self.reasoningParser = reasoningParser
         self.toolParser = toolParser
@@ -166,6 +210,10 @@ public struct JangCapabilities: Sendable {
         self.family = family
         self.modality = modality
         self.cacheType = cacheType
+        self.draftStrategy = draftStrategy
+        self.drafterPath = drafterPath
+        self.branchingBudget = branchingBudget
+        self.blockSize = blockSize
     }
 
     /// Source of a parser resolution — used for telemetry and so callers
@@ -218,19 +266,32 @@ public enum ParserResolution {
                 .jangStamped
             )
         }
-        // Heuristic by model_type. We treat any model_type that hasn't
-        // been listed as `mistral`/`gemma`/`gemma4` as potentially
-        // reasoning-capable and return a default `<think>...</think>`
-        // parser. This matches Qwen 3.5 / 3.6 / DeepSeek / GLM / Nemotron
-        // behaviour. False positives are harmless — the parser only
-        // splits when it sees actual `<think>` markers in the stream.
+        // Heuristic by model_type. We treat most model types as
+        // `<think>`-family and return a parser tuned for that. Gemma 4
+        // uses a different wire format (harmony channel envelope) and
+        // gets a dedicated parser. Gemma 3 / 3n and Mistral have no
+        // reasoning envelope.
         guard let modelType, !modelType.isEmpty else {
             return (nil, .none)
         }
         let t = modelType.lowercased()
+        if t.hasPrefix("gemma4") {
+            return (
+                ReasoningParser.fromCapabilityName("harmony"),
+                .modelTypeHeuristic
+            )
+        }
         if t.hasPrefix("mistral") || t.hasPrefix("gemma") {
             return (nil, .modelTypeHeuristic)
         }
+        // The `<think>…</think>` family — Qwen 3.5 / 3.6, DeepSeek-R1,
+        // GLM 4.x, Nemotron. The default parser returned here starts in
+        // content mode to preserve byte-for-byte compatibility with the
+        // previous behaviour; Evaluate / BatchEngine resolve the
+        // `think_xml` capability stamp themselves via
+        // `ReasoningParser.fromCapabilityName` (which now returns a
+        // parser with `startInReasoning=true` to handle the Qwen 3.6
+        // enable_thinking=true prefill case).
         return (ReasoningParser(), .modelTypeHeuristic)
     }
 
@@ -252,6 +313,61 @@ public enum ParserResolution {
             return (inferred, .modelTypeHeuristic)
         }
         return (nil, .none)
+    }
+
+    /// Resolve a ``DraftStrategy`` from JANG capability stamp.
+    ///
+    /// Maps `capabilities.draft_strategy` + `capabilities.drafter_path`
+    /// + `capabilities.branching_budget` + `capabilities.block_size` into
+    /// a concrete `DraftStrategy` enum. The drafter path is resolved
+    /// relative to `modelDirectory` (the snapshot root containing
+    /// `jang_config.json`) — JANG bundles ship drafters co-located.
+    ///
+    /// Returns `nil` when:
+    /// - `capabilities` is nil.
+    /// - `draftStrategy` is nil, `"none"`, or unrecognised.
+    /// - `drafterPath` is nil (strategy requires one but bundle
+    ///   doesn't ship it).
+    /// - `blockSize` is nil (required for both `.dflash` + `.ddtree`).
+    ///
+    /// - Parameters:
+    ///   - capabilities: the `JangCapabilities` block from
+    ///     `jang_config.json`.
+    ///   - modelDirectory: the snapshot root. `capabilities.drafter_path`
+    ///     is appended to this.
+    public static func draftStrategy(
+        capabilities: JangCapabilities?,
+        modelDirectory: URL
+    ) -> (strategy: DraftStrategy?, source: JangCapabilities.ResolutionSource) {
+        guard let cap = capabilities,
+            let name = cap.draftStrategy?.lowercased(),
+            name != "none",
+            let relativePath = cap.drafterPath,
+            let blockSize = cap.blockSize
+        else {
+            return (nil, .none)
+        }
+        let drafterURL = modelDirectory
+            .appendingPathComponent(relativePath, isDirectory: true)
+            .resolvingSymlinksInPath()
+        switch name {
+        case "dflash":
+            return (
+                .dflash(drafterPath: drafterURL, blockSize: blockSize),
+                .jangStamped
+            )
+        case "ddtree":
+            let budget = cap.branchingBudget ?? 32
+            return (
+                .ddtree(
+                    drafterPath: drafterURL,
+                    branchingBudget: budget,
+                    blockSize: blockSize),
+                .jangStamped
+            )
+        default:
+            return (nil, .none)
+        }
     }
 }
 
@@ -320,6 +436,229 @@ public struct JangLoader: Sendable {
         return nil
     }
 
+    /// Resolve the directory that holds tokenizer files for a given model.
+    ///
+    /// The HuggingFace tokenizer loader (`AutoTokenizer.from(modelFolder:)`)
+    /// expects `tokenizer.json` and/or `tokenizer_config.json` (plus optionally
+    /// `chat_template.jinja`) in the directory it is pointed at. Most JANG /
+    /// JANGTQ bundles ship **weights-only** — the snapshot directory contains
+    /// `model.safetensors`, `config.json`, `jang_config.json` (and sometimes
+    /// `jangtq_runtime.safetensors`) but no tokenizer files. Users are
+    /// expected to re-use the tokenizer from the source model declared in
+    /// `jang_config.json["source_model"]`.
+    ///
+    /// This helper implements that fallback for local-directory loads:
+    ///
+    /// 1. If `modelDirectory` itself has `tokenizer_config.json` or
+    ///    `tokenizer.json` → return it unchanged (standard path).
+    /// 2. Else if `modelDirectory` has `jang_config.json` with a populated
+    ///    `source_model.org` + `source_model.name` → look up the HuggingFace
+    ///    cache directory for that repo (`~/.cache/huggingface/hub/models--<org>--<name>`)
+    ///    and return the first snapshot that has tokenizer files.
+    /// 3. Else → return `modelDirectory` unchanged. The tokenizer loader will
+    ///    surface its own error, which is the same behaviour as before this
+    ///    helper existed.
+    ///
+    /// The fallback path **does not** perform network downloads. It only
+    /// finds a tokenizer that has already been cached by `Downloader`. If the
+    /// source model isn't cached, the returned URL still won't have
+    /// tokenizer files and the loader will fail with a clear "no tokenizer"
+    /// error — which is the signal for callers to `.download(id:)` the source
+    /// repo first.
+    ///
+    /// - Parameters:
+    ///   - modelDirectory: Directory of the model being loaded.
+    ///   - huggingFaceCacheRoot: Override for the HF cache root. Defaults to
+    ///     `~/.cache/huggingface/hub`. Exposed for unit tests.
+    ///   - fileManager: File-manager used for probe. Exposed for unit tests.
+    /// - Returns: A directory that should be passed to the tokenizer loader.
+    public static func resolveTokenizerDirectory(
+        for modelDirectory: URL,
+        huggingFaceCacheRoot: URL? = nil,
+        fileManager: FileManager = .default
+    ) -> URL {
+        if hasTokenizerFiles(at: modelDirectory, fileManager: fileManager) {
+            return modelDirectory
+        }
+        guard isJangModel(at: modelDirectory) else { return modelDirectory }
+
+        // Read source_model from jang_config.json. Any parse failure or
+        // missing org/name → caller gets the default (unchanged) path.
+        let config: JangConfig
+        do {
+            config = try loadConfig(at: modelDirectory)
+        } catch {
+            return modelDirectory
+        }
+        let repo = config.sourceModel.huggingFaceRepoID
+        guard !repo.isEmpty else { return modelDirectory }
+
+        let cacheRoot = huggingFaceCacheRoot ?? defaultHuggingFaceCacheRoot()
+        let cacheDirName = "models--\(config.sourceModel.org)--\(config.sourceModel.name)"
+        let snapshotsRoot = cacheRoot
+            .appendingPathComponent(cacheDirName)
+            .appendingPathComponent("snapshots")
+
+        guard let entries = try? fileManager.contentsOfDirectory(
+            at: snapshotsRoot,
+            includingPropertiesForKeys: nil
+        ) else {
+            return modelDirectory
+        }
+
+        // First snapshot directory that actually has tokenizer files wins.
+        // HuggingFace snapshots are immutable per revision, so any of them
+        // with the files is equally good; the presence check is what matters.
+        for snapshot in entries where hasTokenizerFiles(at: snapshot, fileManager: fileManager) {
+            return snapshot
+        }
+        return modelDirectory
+    }
+
+    /// Check whether a directory already has the files that the HuggingFace
+    /// tokenizer loader needs. Used by `resolveTokenizerDirectory(for:)`.
+    public static func hasTokenizerFiles(
+        at directory: URL,
+        fileManager: FileManager = .default
+    ) -> Bool {
+        for name in ["tokenizer.json", "tokenizer_config.json"] {
+            let url = directory.appendingPathComponent(name)
+            if fileManager.fileExists(atPath: url.path) { return true }
+        }
+        return false
+    }
+
+    // MARK: - tokenizer_class substitution
+
+    /// swift-transformers 0.1.21's `knownTokenizers` doesn't include
+    /// `TokenizersBackend` (used by some mlx-community snapshots like
+    /// `mlx-community/Qwen3.5-VL-9B-8bit`) — loads throw
+    /// `TokenizerError.unsupportedTokenizer("TokenizersBackend")`. This
+    /// set lists all classes we know swift-transformers accepts. Callers
+    /// that need different substitutions can override via env var
+    /// `VMLX_TOKENIZER_CLASS_OVERRIDE=<target>`.
+    public static let knownSupportedTokenizerClasses: Set<String> = [
+        "CodeGenTokenizer", "CodeLlamaTokenizer", "FalconTokenizer",
+        "GemmaTokenizer", "GPT2Tokenizer", "LlamaTokenizer", "T5Tokenizer",
+        "WhisperTokenizer", "CohereTokenizer", "Qwen2Tokenizer",
+        "PreTrainedTokenizer",
+    ]
+
+    /// Substitution map: when `tokenizer_class` is a key in this map
+    /// and no env override is set, rewrite to the value. Tuned from
+    /// real-world snapshots: `TokenizersBackend` on Qwen-family VL
+    /// models is functionally `Qwen2Tokenizer`.
+    public static let defaultTokenizerClassSubstitutions: [String: String] = [
+        "TokenizersBackend": "Qwen2Tokenizer",
+    ]
+
+    /// Like `resolveTokenizerDirectory(for:)` but also fixes
+    /// `tokenizer_class` in `tokenizer_config.json` to an entry that
+    /// swift-transformers 0.1.21 knows. If the class is already known,
+    /// returns the input directory unchanged. If unknown and no
+    /// substitute is available, returns unchanged (let the loader
+    /// surface the clear error).
+    ///
+    /// When a substitution is required, writes a shim directory into
+    /// `<tmp>/vmlx-tokenizer-shim-<uuid>/` containing the rewritten
+    /// `tokenizer_config.json` plus symlinks to every other tokenizer
+    /// file (tokenizer.json, chat_template.jinja, etc.). The caller
+    /// should clean up the shim dir when done, but since they live in
+    /// the OS temp dir the OS sweeps them eventually.
+    ///
+    /// Order of operations for a full load:
+    ///
+    /// 1. Caller has a model directory (maybe JANG, maybe not).
+    /// 2. `resolveTokenizerDirectory(for:)` redirects weights-only JANG
+    ///    bundles to their source-model snapshot.
+    /// 3. `resolveTokenizerClassSubstitution(for:)` (this function)
+    ///    rewrites `tokenizer_class` if it's unsupported.
+    /// 4. The returned URL is passed to
+    ///    `AutoTokenizer.from(modelFolder:)`.
+    public static func resolveTokenizerClassSubstitution(
+        for directory: URL,
+        overrideClass: String? = nil,
+        fileManager: FileManager = .default
+    ) -> URL {
+        let configURL = directory.appendingPathComponent("tokenizer_config.json")
+        guard fileManager.fileExists(atPath: configURL.path) else {
+            return directory  // nothing to rewrite; downstream loader errors
+        }
+        guard let data = try? Data(contentsOf: configURL),
+              var json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else {
+            return directory
+        }
+
+        let currentClass = json["tokenizer_class"] as? String ?? ""
+        let trimmedCurrent = currentClass.replacingOccurrences(of: "Fast", with: "")
+
+        // Decide the target class.
+        let target: String
+        let envOverride = overrideClass
+            ?? ProcessInfo.processInfo.environment["VMLX_TOKENIZER_CLASS_OVERRIDE"]
+        if let envOverride, !envOverride.isEmpty {
+            target = envOverride
+        } else if knownSupportedTokenizerClasses.contains(trimmedCurrent) {
+            return directory  // already supported
+        } else if let mapped = defaultTokenizerClassSubstitutions[currentClass]
+                            ?? defaultTokenizerClassSubstitutions[trimmedCurrent] {
+            target = mapped
+        } else {
+            return directory  // unknown class, no known substitute
+        }
+
+        // If nothing to change, skip.
+        if target == currentClass { return directory }
+
+        json["tokenizer_class"] = target
+
+        // Write to a shim dir next to the original.
+        let shimDir = fileManager.temporaryDirectory.appendingPathComponent(
+            "vmlx-tokenizer-shim-\(UUID().uuidString)")
+        do {
+            try fileManager.createDirectory(
+                at: shimDir, withIntermediateDirectories: true)
+            let rewritten = try JSONSerialization.data(
+                withJSONObject: json, options: [.prettyPrinted, .sortedKeys])
+            try rewritten.write(
+                to: shimDir.appendingPathComponent("tokenizer_config.json"))
+            // Symlink all OTHER files — tokenizer.json especially is often
+            // large and we don't want to duplicate it.
+            let entries = (try? fileManager.contentsOfDirectory(
+                at: directory, includingPropertiesForKeys: nil)) ?? []
+            for entry in entries where entry.lastPathComponent != "tokenizer_config.json" {
+                let dest = shimDir.appendingPathComponent(entry.lastPathComponent)
+                // Some tokenizer caches already contain symlinks — follow them
+                // so our shim links to the actual file, not another link.
+                let real = (try? fileManager.destinationOfSymbolicLink(atPath: entry.path))
+                    .flatMap { relative in
+                        URL(fileURLWithPath: relative, relativeTo: entry.deletingLastPathComponent())
+                            .standardizedFileURL
+                    } ?? entry
+                try? fileManager.createSymbolicLink(at: dest, withDestinationURL: real)
+            }
+            return shimDir
+        } catch {
+            return directory
+        }
+    }
+
+    /// Default HuggingFace hub cache root. Honours `HF_HOME` and `HF_HUB_CACHE`
+    /// environment variables, otherwise falls back to `~/.cache/huggingface/hub`
+    /// — matching the Python `huggingface_hub` resolution order.
+    public static func defaultHuggingFaceCacheRoot() -> URL {
+        let env = ProcessInfo.processInfo.environment
+        if let hubCache = env["HF_HUB_CACHE"], !hubCache.isEmpty {
+            return URL(fileURLWithPath: hubCache)
+        }
+        if let hfHome = env["HF_HOME"], !hfHome.isEmpty {
+            return URL(fileURLWithPath: hfHome).appendingPathComponent("hub")
+        }
+        return FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".cache/huggingface/hub")
+    }
+
     /// Load and parse the JANG config from a model directory.
     public static func loadConfig(at modelPath: URL) throws -> JangConfig {
         guard let configURL = findConfigPath(at: modelPath) else {
@@ -367,6 +706,8 @@ public struct JangLoader: Sendable {
             }
             sourceModel = JangSourceModel(
                 name: smDict["name"] as? String ?? "",
+                org: smDict["org"] as? String ?? "",
+                architecture: smDict["architecture"] as? String ?? "",
                 dtype: smDict["dtype"] as? String ?? "bfloat16",
                 parameters: params
             )
@@ -407,7 +748,11 @@ public struct JangLoader: Sendable {
                 supportsThinking: cDict["supports_thinking"] as? Bool,
                 family: cDict["family"] as? String,
                 modality: cDict["modality"] as? String,
-                cacheType: cDict["cache_type"] as? String
+                cacheType: cDict["cache_type"] as? String,
+                draftStrategy: cDict["draft_strategy"] as? String,
+                drafterPath: cDict["drafter_path"] as? String,
+                branchingBudget: cDict["branching_budget"] as? Int,
+                blockSize: cDict["block_size"] as? Int
             )
         } else {
             capabilities = nil

@@ -336,13 +336,9 @@ public final class VLMModelFactory: GenericModelFactory {
         var mutableConfiguration = configuration
         mutableConfiguration.eosTokenIds = eosTokenIds
 
-        // Auto-detect tool call format from model type if not explicitly set
-        if mutableConfiguration.toolCallFormat == nil {
-            mutableConfiguration.toolCallFormat = ToolCallFormat.infer(from: baseConfig.modelType)
-        }
-
-        // Detect JANG model — if jang_config.json exists, load it for per-layer quantization.
-        // Standard MLX models skip this entirely (jangConfig stays nil).
+        // Detect JANG model BEFORE tool-format selection so the `capabilities.tool_parser`
+        // stamp is authoritative for JANG bundles. Standard MLX models skip this and
+        // jangConfig stays nil, in which case we fall through to the model_type heuristic.
         let jangConfig: JangConfig?
         if JangLoader.isJangModel(at: modelDirectory) {
             jangConfig = try JangLoader.loadConfig(at: modelDirectory)
@@ -350,13 +346,50 @@ public final class VLMModelFactory: GenericModelFactory {
             jangConfig = nil
         }
 
+        // Tool-format resolution priority (same rationale as LLMModelFactory):
+        //   1. Caller-supplied `configuration.toolCallFormat` (explicit override).
+        //   2. JANG `capabilities.tool_parser` stamp — authoritative when set.
+        //   3. `ToolCallFormat.infer(from: modelType)` heuristic — last resort.
+        if mutableConfiguration.toolCallFormat == nil {
+            let jangStamped = ToolCallFormat.fromCapabilityName(
+                jangConfig?.capabilities?.toolParser)
+            mutableConfiguration.toolCallFormat = jangStamped
+                ?? ToolCallFormat.infer(from: baseConfig.modelType)
+        }
+
+        // Reasoning-parser stamp (same precedence as LLMModelFactory).
+        // VL models that emit `<think>` follow the same Qwen / DeepSeek
+        // conventions as their text-only counterparts.
+        if mutableConfiguration.reasoningParserName == nil {
+            if let stamp = jangConfig?.capabilities?.reasoningParser {
+                mutableConfiguration.reasoningParserName = stamp
+            } else {
+                let t = baseConfig.modelType.lowercased()
+                if t.hasPrefix("gemma4") {
+                    mutableConfiguration.reasoningParserName = "harmony"
+                } else if t.hasPrefix("mistral") || t.hasPrefix("gemma") {
+                    mutableConfiguration.reasoningParserName = "none"
+                } else {
+                    mutableConfiguration.reasoningParserName = "think_xml"
+                }
+            }
+        }
+
         // Load tokenizer from model directory (or alternate tokenizer repo),
         // processor config, and weights in parallel using async let.
         // Note: loadProcessorConfig does synchronous I/O but is marked async to enable
         // parallel scheduling. This may briefly block a cooperative thread pool thread,
         // but the config file is small and model loading is not a high-concurrency path.
-        async let tokenizerTask = tokenizerLoader.load(
-            from: configuration.tokenizerDirectory)
+        //
+        // JANG VL bundles (e.g. Qwen3.5-VL-*-JANG_*) may also ship
+        // weights-only. `resolveTokenizerDirectory` falls back to the cached
+        // source model's tokenizer when that happens; otherwise returns the
+        // original directory unchanged.
+        let jangResolvedDir = JangLoader.resolveTokenizerDirectory(
+            for: configuration.tokenizerDirectory)
+        let tokenizerDirectory = JangLoader.resolveTokenizerClassSubstitution(
+            for: jangResolvedDir)
+        async let tokenizerTask = tokenizerLoader.load(from: tokenizerDirectory)
         async let processorConfigTask = loadProcessorConfig(from: modelDirectory)
 
         try loadWeights(
@@ -391,18 +424,22 @@ public final class VLMModelFactory: GenericModelFactory {
             configuration: processorConfigData,
             processorType: processorType, tokenizer: tokenizer)
 
-        // Build a ModelConfiguration for the ModelContext
+        // Build a ModelConfiguration for the ModelContext. When the JANG
+        // fallback resolved to a different directory than the caller
+        // requested, surface that in the `tokenizerSource` so any re-load
+        // via this config uses the same tokenizer.
         let tokenizerSource: TokenizerSource? =
-            configuration.tokenizerDirectory == modelDirectory
+            tokenizerDirectory == modelDirectory
             ? nil
-            : .directory(configuration.tokenizerDirectory)
+            : .directory(tokenizerDirectory)
         let modelConfig = ModelConfiguration(
             directory: modelDirectory,
             tokenizerSource: tokenizerSource,
             defaultPrompt: configuration.defaultPrompt,
             extraEOSTokens: mutableConfiguration.extraEOSTokens,
             eosTokenIds: mutableConfiguration.eosTokenIds,
-            toolCallFormat: mutableConfiguration.toolCallFormat)
+            toolCallFormat: mutableConfiguration.toolCallFormat,
+            reasoningParserName: mutableConfiguration.reasoningParserName)
 
         return .init(
             configuration: modelConfig, model: model, processor: processor,

@@ -61,6 +61,11 @@ public struct PythonicToolCallParser: ToolCallParser, Sendable {
         return ToolCall(function: .init(name: funcName, arguments: arguments))
     }
 
+    /// At end-of-sequence, extract every pythonic call in the buffer —
+    /// Pythonic models legitimately emit multiple `name(args)` invocations
+    /// inside one `[...]` block, and the default protocol `parseEOS` only
+    /// surfaces the first. Byte-compatible with upstream
+    /// ml-explore/mlx-swift-lm so `LFM2` streams behave identically.
     public func parseEOS(_ toolCallBuffer: String, tools: [[String: any Sendable]]?) -> [ToolCall] {
         if let startTag {
             return
@@ -82,18 +87,27 @@ public struct PythonicToolCallParser: ToolCallParser, Sendable {
 
         text = text.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        let regex = #/(?s)(\w+)\((.*?)\)/#
-        let matches = text.matches(of: regex)
+        // Match every `name(args)` — NSRegularExpression (not Swift regex
+        // literal) keeps us compatible with older Swift toolchains that
+        // don't parse `#/(?s)(\w+)\((.*?)\)/#` at compile time. The `(?s)`
+        // dotall flag is expressed via `.dotMatchesLineSeparators`.
+        let pattern = #"(\w+)\(([^)]*(?:\)[^)]*)*?)\)"#
+        guard let regex = try? NSRegularExpression(
+            pattern: pattern, options: [.dotMatchesLineSeparators])
+        else { return [] }
+        let matches = regex.matches(
+            in: text, options: [], range: NSRange(text.startIndex..., in: text))
 
         var results: [ToolCall] = []
         for match in matches {
-            let funcName = String(match.1)
-            let argsString = String(match.2)
+            guard let nameRange = Range(match.range(at: 1), in: text),
+                let argsRange = Range(match.range(at: 2), in: text)
+            else { continue }
+            let funcName = String(text[nameRange])
+            let argsString = String(text[argsRange])
             let arguments = parseArguments(argsString, funcName: funcName, tools: tools)
-
             results.append(ToolCall(function: .init(name: funcName, arguments: arguments)))
         }
-
         return results
     }
 

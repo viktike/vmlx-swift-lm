@@ -77,9 +77,25 @@ public struct ReasoningParser: Sendable {
 
     // MARK: Init
 
-    public init(startTag: String = "<think>", endTag: String = "</think>") {
+    /// - Parameters:
+    ///   - startTag: The tag that opens a reasoning block.
+    ///   - endTag: The tag that closes a reasoning block.
+    ///   - startInReasoning: Start the parser already inside a reasoning
+    ///     block. Use this when the chat template prefills the opening
+    ///     tag at the prompt tail (e.g. Qwen 3.6 emits `<think>\n` at
+    ///     the end of the assistant prompt when `enable_thinking=true`,
+    ///     which is the template default) — the model's first output
+    ///     byte is already reasoning, so starting in `.content` mode
+    ///     would leak the entire CoT into the visible answer until the
+    ///     first `</think>` flips state.
+    public init(
+        startTag: String = "<think>",
+        endTag: String = "</think>",
+        startInReasoning: Bool = false
+    ) {
         self.startTag = startTag
         self.endTag = endTag
+        self.insideReasoning = startInReasoning
     }
 
     // MARK: Streaming API
@@ -163,26 +179,127 @@ extension ReasoningParser {
     /// Build a parser from a `JangCapabilities.reasoningParser` string.
     ///
     /// Accepts every name the JANG converter currently produces plus the
-    /// canonical `think_xml`/`none` values. Unknown names → `nil` (caller
-    /// should fall back to model-type heuristics or skip parsing).
+    /// canonical `think_xml` / `harmony` / `none` values. Unknown names
+    /// → `nil` (caller should fall back to model-type heuristics or skip
+    /// parsing).
     ///
-    /// All `<think>...</think>`-style aliases collapse to a single
-    /// `ReasoningParser` instance because the syntax is identical across
-    /// Qwen 3.5/3.6, DeepSeek-R1, GLM 4.x, and Nemotron Cascade. Models
-    /// that have no native reasoning tags (`mistral`, `gemma4`, `none`)
-    /// return `nil` so callers know to skip parsing entirely.
+    /// Returns parsers pre-configured for each family's wire format:
+    ///
+    /// - **`<think>` family** (Qwen 3.5 / 3.6, DeepSeek-R1, GLM 4.x,
+    ///   Nemotron, MiniMax) — `<think>…</think>`. The Qwen 3.6 chat
+    ///   template prefills `<think>\n` at the end of the assistant
+    ///   prompt by default (`enable_thinking=true` branch), so the
+    ///   model's first output byte is ALREADY inside a think block.
+    ///   To route those pre-`</think>` bytes to `.reasoning` instead of
+    ///   leaking them into `.chunk`, we return parsers with
+    ///   `startInReasoning=true`. Callers that explicitly disabled
+    ///   `enable_thinking` should construct a parser directly with
+    ///   `ReasoningParser()` (default `startInReasoning=false`).
+    ///
+    /// - **`harmony` family** (Gemma-4) — `<|channel>thought\n…<channel|>`.
+    ///   Gemma-4's chat template emits this envelope unconditionally
+    ///   for the thinking channel (an empty block when
+    ///   `enable_thinking=false`, a populated block otherwise). The
+    ///   model emits the opening tag explicitly, so `startInReasoning`
+    ///   stays false.
+    ///
+    /// - **`none`** (Mistral, LFM2, plain models) — returns `nil` so the
+    ///   pipeline skips reasoning parsing entirely.
     public static func fromCapabilityName(_ name: String?) -> ReasoningParser? {
         guard let name, !name.isEmpty else { return nil }
         switch name.lowercased() {
         case "think_xml", "qwen3", "qwen3_5", "qwen35", "qwen3_6", "qwen36",
             "deepseek_r1", "deepseek-r1", "deepseek", "glm", "glm4", "glm5",
             "nemotron", "nemotron_h", "minimax", "minimax_m2":
-            return ReasoningParser()
-        case "none", "off", "disabled", "mistral", "gemma", "gemma4":
+            // Start inside the reasoning block — matches the Qwen 3.x
+            // family's chat-template default (`enable_thinking=true`
+            // prefills `<think>\n` at prompt tail).
+            return ReasoningParser(startInReasoning: true)
+        case "harmony", "harmony_channel", "gemma4_channel", "gemma4":
+            // Gemma-4 harmony-channel envelope. The training template
+            // emits `<|channel>thought\n…\n<channel|>` for CoT (see
+            // chat_template.jinja line 238), but at inference the
+            // model also emits other channel names — `<|channel>`
+            // followed by a JSON action block then `<channel|>` for
+            // ReAct-style tool hints, `<|channel>analysis…<channel|>`
+            // etc. We latch on the bare `<|channel>` opener so ANY
+            // channel routes to `.reasoning` and nothing in the
+            // envelope leaks into `.chunk`. The channel-name bytes
+            // after `<|channel>` are emitted as part of the reasoning
+            // delta — osaurus-side UIs can show them raw or split on
+            // the first newline if they want channel routing.
+            return ReasoningParser(
+                startTag: "<|channel>",
+                endTag: "<channel|>",
+                startInReasoning: false)
+        case "none", "off", "disabled", "mistral", "gemma":
             return nil
         default:
             return nil
         }
+    }
+
+    /// Build a parser that accounts for the actual prompt state.
+    ///
+    /// Some chat templates prefill the reasoning opener (e.g. Qwen 3.x
+    /// default emits `<think>\n` at prompt tail so the model output
+    /// begins ALREADY inside a think block) while other template
+    /// branches fully open AND close it inside the prompt (e.g. Qwen
+    /// 3.x with `enable_thinking=false` emits `<think>\n\n</think>\n\n`
+    /// — the model's output is pure content).
+    ///
+    /// `fromCapabilityName` can only return a stamp-based default.
+    /// This method takes the DECODED tail of the prompt and overrides
+    /// `startInReasoning` based on which state the prompt ends in.
+    ///
+    /// - Parameters:
+    ///   - stampName: the `reasoningParserName` capability stamp.
+    ///   - promptTail: decoded tail of the prompt (enough bytes to
+    ///     contain any relevant opener/closer tags). Typically the
+    ///     last ~100 characters of the prompt suffice. Pass `nil` to
+    ///     fall back to stamp defaults.
+    /// - Returns: a parser, or nil if the stamp resolves to no parser.
+    public static func forPrompt(
+        stampName: String?,
+        promptTail: String?
+    ) -> ReasoningParser? {
+        guard let base = fromCapabilityName(stampName) else { return nil }
+
+        // No prompt hint → use stamp default (whatever insideReasoning
+        // was baked into `base` by fromCapabilityName).
+        guard let promptTail, !promptTail.isEmpty else { return base }
+
+        // Detect the last tag at the prompt tail.
+        let startTag = base.startTag
+        let endTag = base.endTag
+        let lastOpener = promptTail.range(of: startTag, options: .backwards)
+        let lastCloser = promptTail.range(of: endTag, options: .backwards)
+
+        let startInReasoning: Bool
+        switch (lastOpener, lastCloser) {
+        case (let o?, let c?):
+            // Whichever tag appears LATER wins. If closer is after opener
+            // (the full block closed in the prompt), we start in content.
+            // If opener is after closer (the model already re-opened a
+            // block), start in reasoning.
+            startInReasoning = o.lowerBound > c.lowerBound
+        case (.some, nil):
+            // Opener with no closer → prompt ends inside a think block.
+            startInReasoning = true
+        case (nil, .some):
+            // Closer with no opener → prompt ends in content.
+            startInReasoning = false
+        case (nil, nil):
+            // Neither tag seen in the tail — trust stamp default.
+            // Reconstruct the parser with its stamp-inferred initial
+            // state by re-calling fromCapabilityName.
+            return base
+        }
+
+        return ReasoningParser(
+            startTag: startTag,
+            endTag: endTag,
+            startInReasoning: startInReasoning)
     }
 }
 
