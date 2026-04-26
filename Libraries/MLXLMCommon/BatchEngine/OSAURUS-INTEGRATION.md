@@ -141,6 +141,7 @@ Both `LLMModelFactory` and `VLMModelFactory` stamp the two capability fields on 
 | Qwen 3 / 3.5 / 3.6 dense / 3 Coder / Nemotron | `.xmlFunction` | `qwen3` / `think_xml` | ✓ (Qwen 3.6 wire format) |
 | MiniMax M2 / M2.5 | `.minimaxM2` | `minimax` | ✓ |
 | GLM 4.x / DeepSeek-R1 | `.glm4` | `glm4` / `deepseek_r1` | ✓ |
+| **DeepSeek-V4 (incl. JANGTQ)** | **`.dsml`** | **`think_xml`** | ✓ |
 | Kimi K2 | `.kimiK2` | `think_xml` | ✓ |
 | Gemma 3 | `.gemma` | none | — |
 | Gemma 4 (incl. JANG Gemma4WithTools) | `.gemma4` | none | — |
@@ -254,6 +255,66 @@ Osaurus-side integration smoke (after flag flip):
 4. Model swap under `strictSingleModel=true` mid-stream — stress lease eviction deferral.
 
 All four should complete without Metal crashes — those are the crash classes osaurus's `ModelLease` + `MetalGate` layers exist to close; vmlx-swift-lm's `cancel()` path and per-actor serialization match osaurus's assumptions.
+
+---
+
+## DeepSeek-V4 — runtime knobs
+
+DSV4-Flash (43-layer MLA + sqrtsoftplus MoE + per-layer rope + Compressor/Indexer hybrid attention) ships with three cache-mode knobs to balance memory vs. long-context coherence. Auto-detected paths:
+
+- Reasoning parser: `think_xml` (auto, `deepseek_*` model_type).
+- Tool format: `.dsml` (auto on model_type `deepseek_v4`; also via JANG `chat.tool_calling.parser = "dsml"`).
+- Chat template: bundle's `tokenizer_config.json.chat_template` accepts `enable_thinking` (bool) and `reasoning_effort` (`'max'` / `nil`) kwargs through `UserInput.additionalContext` → `applyChatTemplate(messages:tools:additionalContext:)`. Auto-prepends max-effort preface and toggles `<think>` open vs `</think>` closed at the prompt tail.
+
+Cache-mode env knobs (osaurus can set at process start; defaults preserve status-quo):
+
+| Env var | Effect | Memory @ 8K output | Use when |
+|---|---|---|---|
+| (default) | `RotatingKVCache(maxSize: 128)` per layer — local sliding window. Decode beyond 128 tokens loses prompt visibility. | ~6 MB | FIM / short Q&A / classifier prompts. |
+| `DSV4_KV_MODE=full` | `KVCacheSimple` — no rotation, no compression. Model attends to full prompt + decode. | ~360 MB | **Default for any chat / reasoning workload.** |
+| `DSV4_KV_MODE=tq` | `KVCacheSimple` at construction; BatchEngine's `BatchQuantize.maybeCompress` swaps to `TurboQuantKVCache` once the offset crosses the min-token threshold. **Caller must also set `GenerateParameters.kvMode = .turboQuant(3, 3)`** for the swap to fire. | ~14 MB | Long reasoning / agent loops on memory-constrained hosts. |
+
+Auto-promotion: when `parameters.kvMode` is `.turboQuant`, `newCache()` selects `tq` automatically without an env var. Explicit env always wins.
+
+Bundle dispatch / quantization knobs:
+
+| Env var | Effect |
+|---|---|
+| `DSV4_FORCE_JANGTQ=1` | Forces the JANGTQ model class for bundles whose `weight_format` stamp is `bf16` (mislabeled — we've seen this on JANGTQ_2L bundles in the wild). |
+| `DSV4_JANGTQ_BITS={2\|4}` | Routed-MoE codebook bits override. Use `4` for JANGTQ_4 bundles. Default resolution: `weight_format` stamp → config.json `quantization.bits` (only when in `{2, 4}`) → `2`. |
+| `DSV4_LONG_CTX=1` | Activates `DeepseekV4Cache` (persistent compressor pool) on `compress_ratio > 0` layers. PRE-RELEASE — has unresolved Compressor prefill shape edge cases per `research/JANGTQ-COMPRESSOR-INDEXER-PROPER-FIX-2026-04-25.md`. Use `DSV4_KV_MODE=full` instead until the PR #1195 port lands. |
+| `VMLX_CHAT_TEMPLATE_OVERRIDE=/path/to/template.jinja` | Bypass the tokenizer's bundled chat template (e.g. when swift-jinja chokes on a specific construct). |
+| `VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE=1` | Opt out of in-process `DSV4Minimal` fallback when a legacy bundle ships no `chat_template`. |
+
+Loader robustness (2026-04-25): the per-layer quantization inference walks every `.scales` key in the bundle and chooses `(bits, group_size)` from a fixed empirical preference order — `(8,32) (8,64) (8,128) (4,32) (4,64) (4,128) (2,32) (2,64) (2,128) (3,32) (6,32)`. This is shape-authoritative: bundles whose `config.json` got re-stamped with mismatched per-layer overrides (or uniform `bits: 8` while routed experts are actually `bits: 2`) load correctly without manual config patching. Idempotent — clean configs add zero overrides.
+
+**Prompt-mode guidance (live-tested 2026-04-25 on DSV4-Flash JANGTQ):**
+
+| Caller mode | Result |
+|---|---|
+| `applyChatTemplate(...additionalContext: ["enable_thinking": false])` | Clean & correct. Short questions complete in `<10` tokens with proper EOS. |
+| `applyChatTemplate(...additionalContext: ["enable_thinking": true])` + `max_tokens >= 1024` | Correct. Model emits `<think>…</think>` then the answer. |
+| `applyChatTemplate(...additionalContext: ["enable_thinking": true, "reasoning_effort": "max"])` + `max_tokens >= 4096` | Canonical config for hard reasoning / HumanEval-style benchmarks. T=1.0 top_p=1.0 per the DeepSeek paper. |
+| `applyChatTemplate(...additionalContext: ["enable_thinking": true])` + `max_tokens < 512` | ⚠ Mid-think truncation. Model gets cut off before closing `</think>`. Cap higher or use `enable_thinking=false` for short-output workloads. |
+| Raw FIM (no chat template) | ⚠ **Avoid for general chat.** No stop signal → model loops the answer then degenerates into character-level slop on long outputs. Only safe when the prompt itself constrains the continuation (function signature → body). |
+
+The reasoning parser strips `<think>…</think>` from `.chunk` events automatically when consumers want post-thinking content only — see the reasoning channel section above.
+
+**Multi-turn + reasoning gotcha (live-verified 2026-04-25):** when `enable_thinking=true` and `max_tokens` is too low for the model to close `</think>` before the cap, the truncated mid-reasoning text gets injected verbatim into the next turn's prompt and the model goes off-distribution (gibberish output, leaked `</think>` markers in `.chunk`). Two valid mitigations:
+
+1. **Raise `max_tokens` per turn** to ≥ 4096. DSV4 reasoning traces routinely exceed 1K tokens on non-trivial problems.
+2. **Set `drop_thinking: true` on prior assistant messages** before re-applying the chat template. The bundled DSV4 Jinja honors `message.get('drop_thinking', false)` for non-last messages — passing it strips prior reasoning blocks from the rendered prompt and the model only sees the final answers + the new user turn. This is the production pattern for long agent loops.
+
+**Short-prompt thinking quirk (live-verified 2026-04-26):** with `enable_thinking=true` on trivial questions ("What is 7+5?", "Hi", etc.), DSV4 sometimes generates the answer INLINE inside the `<think>` block and emits EOS without ever closing `</think>`. The streaming pipeline correctly routes everything before EOS to `.reasoning(String)` events; `.chunk(String)` is empty; `finish: stop`. This is model behaviour, not a runtime bug — DSV4 was trained to match its own EOS pattern even mid-think on short prompts.
+
+If your UI only renders `.chunk` events, the user sees an empty bubble while the thinking pane has the actual answer. Two consumer-side handling patterns:
+
+1. **Auto-toggle thinking off for casual chat** (recommended). Maintain a per-model `AutoThinkingProfile` that defaults DSV4 to `enable_thinking=false` for chat workloads, only flipping on for explicit reasoning intents. The chat-template kwarg is set per-request via `UserInput.additionalContext: ["enable_thinking": false]` and the model emits a normal `</think>` at the prompt tail → output flows through `.chunk` cleanly.
+2. **Mirror `.reasoning` to displayed content when content is empty + `finish: stop`**. UI-level fallback that surfaces the answer when the model's reasoning trace contains it but `</think>` was never emitted. Less ideal because the displayed text retains a "thinking" tone ("Okay, the user asks 7+5, the answer is 12") rather than a direct answer.
+
+Cross-runtime fp32-internal mHC RMSnorm cast is locked at both layers — Python (`jang_tools/dsv4/mlx_model.py:1346-1382`) and Swift (`Libraries/MLXLLM/Models/DeepseekV4.swift:559-572`, commit `5f64495`). Required for M3 Ultra correctness; M4 happens to keep fp32 in SIMD lanes by accident but the cast is mandatory parity guard. **Do NOT remove the `.asType(.float32)` on `xFlat` and `hcRMSOnes` in `collapse()`** — see `research/DSV4-HC-PRE-FP32-CAST-FIX-2026-04-25.md` for the diagnosis trail.
+
+Cache + L2 disk: `CacheCoordinator` paged tier handles cross-turn prefix reuse; `DiskCache` (TQDiskSerializer v2 with `LayerKind.kvSimple` / `.tqCompressed` / `.qkv` / `.mamba` / `.rotating` tags) round-trips all layer types including DSV4's per-layer mix. The 2026-04-24 `BatchEngine.swift:733` trim fix ensures full-cache disk hits don't re-feed the last token at the wrong RoPE position.
 
 ---
 

@@ -254,11 +254,14 @@ public enum LLMTypeRegistry {
         let isMxtqStamp =
             weightFormat == "mxtq" || weightFormat == "jangtq2"
             || weightFormat == "jangtq4"
-        // Heuristic match: need explicit force OR explicit mxtq stamp
-        // — purely heuristic dispatch on bits=2/4 alone is unsafe
-        // because JANG_2L (uniform affine 2-bit) shares those config
-        // values. Future improvement: peek the safetensors index for
-        // `tq_packed` keys when neither stamp nor env is set.
+
+        // 2026-04-26: bundles with mislabeled `weight_format: "bf16"`
+        // but real JANGTQ codebook tensors are auto-corrected by
+        // `_load`'s merge step BEFORE this dispatcher fires — when a
+        // valid `jangtq_runtime.safetensors` sidecar is present, the
+        // merge forces `weight_format = "mxtq"`. By the time we
+        // reach this point the stamp is authoritative, so the
+        // existing `isMxtqStamp` check is sufficient.
         if isMxtqStamp || forced {
             // mxtqBits sourcing — the routed-MoE codebook lives in
             // `jangtq_runtime.safetensors` keyed `codebook.{inFeatures}.
@@ -295,7 +298,25 @@ public enum LLMTypeRegistry {
                 else { return nil }
                 return b
             }()
-            let mxtqBits = envBits ?? stampBits ?? configBits ?? 2
+            // `routed_expert_bits` field — populated by `_load`'s
+            // resolution chain (sidecar codebook sniff / profile / etc.)
+            // when the bundle's config didn't ship it directly. Read
+            // here so we prefer it over `configBits` (which can be the
+            // affine non-routed bits = 8, useless for routed-MoE).
+            struct RoutedBitsCheck: Codable {
+                let routedExpertBits: Int?
+                enum CodingKeys: String, CodingKey {
+                    case routedExpertBits = "routed_expert_bits"
+                }
+            }
+            let routedBits: Int? = {
+                guard let r = (try? JSONDecoder.json5().decode(
+                    RoutedBitsCheck.self, from: data))?.routedExpertBits,
+                    r == 2 || r == 4
+                else { return nil }
+                return r
+            }()
+            let mxtqBits = envBits ?? stampBits ?? routedBits ?? configBits ?? 2
             return DeepseekV4JANGTQModel(config, mxtqBits: mxtqBits, mxtqSeed: 42)
         }
         return DeepseekV4Model(config)
@@ -787,16 +808,100 @@ public final class LLMModelFactory: GenericModelFactory {
             {
                 configDict["mxtq_bits"] = routed
             }
+            // 2026-04-26 robustness: bundles in the wild ship inconsistent
+            // routed-bits fields (some have `mxtq_bits` Int, some
+            // `routed_expert_bits` top-level, some only the nested dict
+            // above, some nothing at all). Cascade through the remaining
+            // signals so the runtime never silently picks the wrong
+            // codebook bits and produces garbage:
+            //
+            //   1. `routed_expert_bits` Int at jang_config top-level
+            //   2. Sniff actual codebook bits from the sidecar's
+            //      `codebook.{inFeatures}.{bits}` keys (most reliable —
+            //      determined at quantization time, can't drift)
+            //   3. `profile` string convention ("JANGTQ4" → 4, etc.)
+            //   4. Fall through to the per-config decoder default
+            if configDict["mxtq_bits"] == nil,
+                let routed = jangDict["routed_expert_bits"] as? Int
+            {
+                configDict["mxtq_bits"] = routed
+            }
+            // Sidecar sniff — the conclusive "is this JANGTQ?" signal.
+            // A non-empty codebook in `jangtq_runtime.safetensors`
+            // means routed-MoE experts use the TurboQuant codebook
+            // path, regardless of what the bundle's `weight_format`
+            // stamp says. Some bundles in the wild ship
+            // `weight_format: "bf16"` (mislabeled — the bundle is
+            // actually JANGTQ); without this auto-correction the
+            // dispatch would route to the plain affine class and
+            // fail with "Unhandled keys ['tq_norms', 'tq_packed']"
+            // 60+ shards into the weight load.
+            //
+            // When detected, force `weight_format = "mxtq"` so the
+            // existing dispatch logic routes to JANGTQ via its
+            // normal stamp path — no new convention, no implicit
+            // fields, just patching the bundle metadata in-memory
+            // to match the actual on-disk reality. Logs a one-line
+            // diagnostic so operators can see when the override
+            // fired (a hint to repair the bundle's stamp at source).
+            let sidecarURL = modelDirectory.appending(
+                component: "jangtq_runtime.safetensors")
+            if let sniffed = JANGTQRuntimeCache.sniffCodebookBits(
+                at: sidecarURL)
+            {
+                let priorFormat =
+                    (configDict["weight_format"] as? String) ?? "(unset)"
+                let isMxtqStampAlready = (priorFormat.lowercased() == "mxtq")
+                    || (priorFormat.lowercased() == "jangtq2")
+                    || (priorFormat.lowercased() == "jangtq4")
+                if !isMxtqStampAlready {
+                    configDict["weight_format"] = "mxtq"
+                    FileHandle.standardError.write(
+                        Data("[Load] sidecar codebook present (\(sniffed)-bit) — forced weight_format \"mxtq\" (was: \"\(priorFormat)\"); fix the bundle's jang_config.json\n".utf8))
+                }
+                if configDict["mxtq_bits"] == nil {
+                    configDict["mxtq_bits"] = sniffed
+                }
+            }
+            if configDict["mxtq_bits"] == nil,
+                let profile = jangDict["profile"] as? String,
+                let pBits = jangtqBitsFromProfile(profile)
+            {
+                configDict["mxtq_bits"] = pBits
+            }
+            // Mirror the resolved value into BOTH conventional field
+            // names so each model's decoder sees it under the field
+            // it expects without needing a cross-cutting side-channel:
+            //   - `mxtq_bits`         — Qwen35JANGTQ family
+            //   - `routed_expert_bits` — DSV4 family
+            // Idempotent: only fills missing fields, never overwrites
+            // values the bundle already shipped.
+            if let resolved = configDict["mxtq_bits"] as? Int {
+                if configDict["routed_expert_bits"] == nil {
+                    configDict["routed_expert_bits"] = resolved
+                }
+            }
             // VL-wrapped configs (Qwen3.5-VL, Qwen3.6-VL) put the LLM fields
             // inside `text_config`. The Qwen35JANGTQ decoder tries the
             // top-level first then falls back to decoding from `text_config`,
-            // so mxtq_bits / mxtq_seed must ALSO be mirrored into
-            // `text_config` for the nested decode path to see them.
-            // Without this, JANGTQ4 would silently fall back to the default
-            // bits=2 and crash at first forward with "JANGTQ runtime sidecar
-            // not loaded" (it can't find codebook.*.2 because only .*.4 shipped).
+            // so the routed-bits resolution we just performed must ALSO be
+            // mirrored into `text_config` for the nested decode path to
+            // see it. Includes `routed_expert_bits` (DSV4-VL family
+            // convention) so both decoder shapes work without a separate
+            // injection pass.
+            //
+            // Mirror is unconditional fill-when-missing — never overwrite
+            // a value the bundle's text_config already explicitly set.
+            // This deliberately differs from a "skip if values match"
+            // guard which could fall through and leave text_config nil
+            // when top-level was just resolved by our cascade above
+            // (see vmlx-swift §421/§425 — that bug class is closed here
+            // by always running the mirror, not by adding a guard).
             if var textConfig = configDict["text_config"] as? [String: Any] {
-                for key in ["weight_format", "mxtq_seed", "mxtq_bits"] {
+                for key in [
+                    "weight_format", "mxtq_seed", "mxtq_bits",
+                    "routed_expert_bits",
+                ] {
                     if textConfig[key] == nil, let v = configDict[key] {
                         textConfig[key] = v
                     }
