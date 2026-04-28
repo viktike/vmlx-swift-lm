@@ -271,6 +271,30 @@ public actor BatchEngine {
         // which halts upstream generation on substring match.
         let (outStream, continuation) = AsyncStream<Generation>.makeStream()
         let engineRef = self
+
+        // Reap the slot when the consumer stops iterating (cancellation,
+        // explicit break, or task drop). Without this, an orphan slot
+        // keeps stepping inside the engine's scheduling loop, holding
+        // Metal command buffers + pipelines alive. A subsequent request
+        // that triggers a cache-restore path can collide with the
+        // orphan slot's pipelines mid-encode and trigger
+        // `Device::clear_library` →
+        // `notifyExternalReferencesNonZeroOnDealloc`.
+        //
+        // `cancel(_:)` is idempotent — if the slot already completed
+        // naturally (consumer drained the full stream), the cancel is
+        // a no-op because the slot was removed from `activeSlots` at
+        // `finishSlot()` time. So this handler is safe in both the
+        // normal-completion path and the consumer-cancelled path.
+        //
+        // Reported 2026-04-27 by osaurus integrator with the smoking-gun
+        // diagnosis pointing at this exact missing handler.
+        continuation.onTermination = { @Sendable [requestId, engineRef] _ in
+            Task {
+                await engineRef.cancel(requestId)
+            }
+        }
+
         Task {
             var detokenizer = NaiveStreamingDetokenizer(tokenizer: tokenizer)
             let toolCallProcessor = ToolCallProcessor(format: toolCallFormat)
@@ -702,6 +726,26 @@ public actor BatchEngine {
                         if let ssm = ssmStates {
                             restoreSSMStates(ssm, into: slot.cache)
                         }
+                        // 2026-04-27 fix: materialize restored cache state
+                        // in its own command buffer BEFORE prefill builds
+                        // its forward graph. Disk restore produces lazy
+                        // MLXArrays (asType conversions, TQ component
+                        // deserialization, mamba state copies). Without
+                        // an explicit eval here, the next prefill forward
+                        // builds a single command buffer containing both
+                        // the cache materialization AND the model's
+                        // custom kernel dispatches — combined allocation
+                        // pressure can trigger `mlx::core::metal::Device::
+                        // clear_library` mid-encode, evicting a kernel
+                        // pipeline that's still referenced by the
+                        // in-flight buffer →
+                        // `notifyExternalReferencesNonZeroOnDealloc`
+                        // assertion (osaurus repro 2026-04-27 on Qwen-3.6
+                        // 35B A3B MXFP4 with warm disk-tier KV cache).
+                        // Eager eval forces the cache state into GPU
+                        // memory in a SEPARATE command buffer that
+                        // commits before prefill encoding starts.
+                        MLX.eval(slot.cache)
                         restored = true
                         Self.logger.info(
                             "Cache \(detail.rawValue) hit for slot \(slot.id): restored \(diskRestored) tokens from disk, prefilling \(remaining.count) remaining"
