@@ -28,17 +28,16 @@ public struct JSONToolCallParser: ToolCallParser, Sendable {
             text = String(text[..<endRange.lowerBound])
         }
 
-        let toolStr = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        var toolStr = text.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        var remaining = toolStr
-        if let codeType = remaining.range(of: "json") {
-             remaining = String(remaining[codeType.upperBound...])
+        if let codeType = toolStr.range(of: "json") {
+             toolStr = String(toolStr[codeType.upperBound...])
         }
-        if let codeType = remaining.range(of: "tool_code") {
-             remaining = String(remaining[codeType.upperBound...])
+        if let codeType = toolStr.range(of: "tool_code") {
+             toolStr = String(toolStr[codeType.upperBound...])
         }
 
-        let jsonStr = remaining.trimmingCharacters(in: .whitespacesAndNewlines)
+        let jsonStr = toolStr.trimmingCharacters(in: .whitespacesAndNewlines)
 
         guard
             let data = jsonStr.data(using: .utf8),
