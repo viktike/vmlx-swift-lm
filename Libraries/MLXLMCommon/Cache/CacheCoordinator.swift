@@ -146,7 +146,7 @@ public final class CacheCoordinator: @unchecked Sendable {
     ///   - mediaSalt: Optional VLM media fingerprint; `nil` for text-only.
     /// - Returns: A ``CacheFetchResult`` describing the outcome.
     public func fetch(tokens: [Int], mediaSalt: String? = nil) -> CacheFetchResult {
-        NSLog("[CacheCoordinator] Fetching cache for \(tokens.count) tokens")
+        NSLog("[CacheCoordinator] Trying to fetch cache for \(tokens.count) tokens")
 
         // Tier 1: Paged cache (in-memory)
         if let pagedCache,
