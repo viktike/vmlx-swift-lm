@@ -28,7 +28,7 @@ public struct JSONToolCallParser: ToolCallParser, Sendable {
         }
 
         let jsonStr = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        NSLog("Trying to parse tool call JSON: '\(jsonStr)' between tags: \(start) ... \(end)")
+        // NSLog("Trying to parse tool call JSON: '\(jsonStr)' between tags: \(start) ... \(end)")
 
         guard
             let data = jsonStr.data(using: .utf8),
