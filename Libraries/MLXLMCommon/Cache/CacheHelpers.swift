@@ -199,6 +199,7 @@ public func extractSSMStates(from cache: [any KVCache]) -> [MLXArray] {
             }
         }
     }
+    NSLog("[SSMStateCache] Extracted \(states.count) SSM state arrays from model cache")
     return states
 }
 
