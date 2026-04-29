@@ -74,7 +74,7 @@ public final class SSMStateCache: @unchecked Sendable {
 
         // Append to end (most recently used position)
         entries.append((key: key, states: copies))
-        NSLog("[SSMStateCache] Stored state after \(boundary) tokens at \(entries.count) place")
+        NSLog("[SSMStateCache] Stored state after \(boundary) tokens at \(entries.count). place")
 
         // Evict oldest if over capacity
         if entries.count > maxEntries {
