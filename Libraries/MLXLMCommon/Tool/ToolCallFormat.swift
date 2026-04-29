@@ -66,6 +66,9 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     /// Example: `<tool_call>{"name": "func", "arguments": {...}}</tool_call>`
     case json
 
+    /// Qwen2.5 Instuct (Coder) won't wrap tool calls in <tool_code/>
+    case qwen25
+
     /// LFM2/LFM2.5 Pythonic format with model-specific tags.
     /// Example: `<|tool_call_start|>[func(arg='value')]<|tool_call_end|>`
     case lfm2
@@ -120,6 +123,8 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         switch self {
         case .json:
             return JSONToolCallParser(startTag: "<tool_call>", endTag: "</tool_call>")
+        case .qwen25:
+            return JSONToolCallParser(startTag: "```json", endTag: "```")
         case .lfm2:
             return PythonicToolCallParser(
                 startTag: "<|tool_call_start|>", endTag: "<|tool_call_end|>")
@@ -234,6 +239,11 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         // through to this model_type sniff.
         if type.hasPrefix("kimi") {
             return .kimiK2
+        }
+
+        /// Qwen2.5 Instuct (Coder) won't wrap tool calls in <tool_code/>
+        if type.hasPrefix("qwen2") {
+            return .qwen25
         }
 
         // DeepSeek-V4 — `DSML` markup format. Per
