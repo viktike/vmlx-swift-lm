@@ -146,6 +146,8 @@ public final class CacheCoordinator: @unchecked Sendable {
     ///   - mediaSalt: Optional VLM media fingerprint; `nil` for text-only.
     /// - Returns: A ``CacheFetchResult`` describing the outcome.
     public func fetch(tokens: [Int], mediaSalt: String? = nil) -> CacheFetchResult {
+        NSLog("[CacheCoordinator] Fetching cache for \(tokens.count) tokens")
+
         // Tier 1: Paged cache (in-memory)
         if let pagedCache,
            let result = pagedCache.fetchPrefix(tokens: tokens, mediaSalt: mediaSalt)
@@ -170,6 +172,7 @@ public final class CacheCoordinator: @unchecked Sendable {
         }
 
         // Tier 2: Disk cache (exact match, then one-shorter fallback)
+        /**
         if let diskCache {
             if let arrays = diskCache.fetch(tokens: tokens, mediaSalt: mediaSalt) {
                 var ssmStates: [MLXArray]? = nil
@@ -204,6 +207,7 @@ public final class CacheCoordinator: @unchecked Sendable {
                 }
             }
         }
+        **/
 
         // All tiers missed
         return .miss
@@ -244,6 +248,8 @@ public final class CacheCoordinator: @unchecked Sendable {
         let totalTokens = promptTokens.count
         let blockSize = config.pagedBlockSize
 
+        NSLog("[CacheCoordinator] Storing cache after generation, total \(totalTokens) tokens")
+
         // Split per-layer full-sequence data into per-block chunks.
         let blockLayerData = splitLayerDataIntoBlocks(
             perLayerData, blockSize: blockSize, totalTokens: totalTokens)
@@ -267,6 +273,7 @@ public final class CacheCoordinator: @unchecked Sendable {
         // disk persistence for sliding-window models (Gemma3/Gemma4
         // SWA layers, Mistral4 with maxKVSize, MiMoV2Flash, BaichuanM1,
         // Qwen3.5-VL inherited sliding layers).
+        /**
         if let diskCache {
             if let cache {
                 let arrays = TQDiskSerializer.serialize(cache: cache)
@@ -293,6 +300,7 @@ public final class CacheCoordinator: @unchecked Sendable {
                 }
             }
         }
+        **/
 
         // Store SSM companion states for hybrid models
         if isHybrid, let ssmStates, !ssmStates.isEmpty {
@@ -355,5 +363,6 @@ public final class CacheCoordinator: @unchecked Sendable {
         pagedCache?.clear()
         diskCache?.clear()
         ssmStateCache.clear()
+        NSLog("[CacheCoordinator] Cleared all cache tiers")
     }
 }

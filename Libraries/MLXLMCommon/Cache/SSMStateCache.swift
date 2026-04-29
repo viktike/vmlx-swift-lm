@@ -74,10 +74,12 @@ public final class SSMStateCache: @unchecked Sendable {
 
         // Append to end (most recently used position)
         entries.append((key: key, states: copies))
+        NSLog("[SSMStateCache] Stored state after \(boundary) tokens at \(entries.count) place")
 
         // Evict oldest if over capacity
         if entries.count > maxEntries {
             entries.removeFirst()
+            NSLog("[SSMStateCache] Evictied the oldest entry due to capacity limit of \(maxEntries)")
         }
     }
 
@@ -96,6 +98,7 @@ public final class SSMStateCache: @unchecked Sendable {
 
         lock.lock()
         defer { lock.unlock() }
+        NSLog("[SSMStateCache] Trying to fetch state after \(boundary) tokens")
 
         guard let index = entries.firstIndex(where: { $0.key == key }) else {
             misses += 1
@@ -115,6 +118,7 @@ public final class SSMStateCache: @unchecked Sendable {
         entries.append(entry)
 
         hits += 1
+        NSLog("[SSMStateCache] Successfully fetched state after \(boundary) tokens")
 
         // Return deep copies — model forward passes modify SSM state in-place
         return entry.states.map { $0[.ellipsis] }
@@ -124,7 +128,7 @@ public final class SSMStateCache: @unchecked Sendable {
     public func clear() {
         lock.lock()
         defer { lock.unlock() }
-
+        NSLog("[SSMStateCache] Cleared all entries")
         entries.removeAll()
         hits = 0
         misses = 0

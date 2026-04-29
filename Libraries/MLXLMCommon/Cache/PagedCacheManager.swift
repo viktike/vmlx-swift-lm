@@ -212,6 +212,7 @@ public final class PagedCacheManager: @unchecked Sendable {
     ) {
         lock.lock()
         defer { lock.unlock() }
+        NSLog("[PagedCacheManager] Storing token sequence of length \(tokens.count)")
 
         var parentHash: String? = nil
         var chunkIndex = 0
@@ -283,6 +284,8 @@ public final class PagedCacheManager: @unchecked Sendable {
 
         let matchedTokens = matchedBlocks.count * blockSize
         let remainingTokens = Array(tokens[offset...])
+
+        NSLog("[PagedCacheManager] Fetched prefix of length \(matchedTokens) out of \(tokens.count), remaining: \(remainingTokens.count)")
 
         return PrefixFetchResult(
             matchedTokens: matchedTokens,
