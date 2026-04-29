@@ -23,21 +23,23 @@ public struct JSONToolCallParser: ToolCallParser, Sendable {
         if let startRange = text.range(of: start) {
             text = String(text[startRange.upperBound...])
         }
-
         if let endRange = text.range(of: end) {
             text = String(text[..<endRange.lowerBound])
         }
 
         var toolStr = text.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        if let codeType = toolStr.range(of: "json") {
-             toolStr = String(toolStr[codeType.upperBound...])
+        if toolStr.hasPrefix("json") {
+            NSLog("Stripping code type prefix: 'json'")
+            toolStr = String(toolStr.dropFirst(4))
         }
-        if let codeType = toolStr.range(of: "tool_code") {
-             toolStr = String(toolStr[codeType.upperBound...])
+        if toolStr.hasPrefix("tool_code") {
+            NSLog("Stripping code type prefix: 'tool_code'")
+            toolStr = String(toolStr.dropFirst(9))
         }
 
         let jsonStr = toolStr.trimmingCharacters(in: .whitespacesAndNewlines)
+        NSLog("Possible JSON tool: \(jsonStr)")
 
         guard
             let data = jsonStr.data(using: .utf8),
