@@ -23,11 +23,22 @@ public struct JSONToolCallParser: ToolCallParser, Sendable {
         if let startRange = text.range(of: start) {
             text = String(text[startRange.upperBound...])
         }
+
         if let endRange = text.range(of: end) {
             text = String(text[..<endRange.lowerBound])
         }
 
-        let jsonStr = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let toolStr = text.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        var remaining = toolStr
+        if let codeType = remaining.range(of: "json") {
+             remaining = String(remaining[codeType.upperBound...])
+        }
+        if let codeType = remaining.range(of: "tool_code") {
+             remaining = String(remaining[codeType.upperBound...])
+        }
+
+        let jsonStr = remaining.trimmingCharacters(in: .whitespacesAndNewlines)
 
         guard
             let data = jsonStr.data(using: .utf8),
