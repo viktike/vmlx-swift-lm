@@ -4,17 +4,21 @@ import Foundation
 
 /// Parser for JSON format: <tag>{"name": "...", "arguments": {...}}</tag>
 /// Reference: https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/tool_parsers/default.py
-public struct JSONToolCallParser: ToolCallParser, Sendable {
+public struct CodeBlockToolCallParser: ToolCallParser, Sendable {
     public let startTag: String?
     public let endTag: String?
+    private let codeType: String?
+    private let codeBlock: String?
 
-    public init(startTag: String, endTag: String) {
-        self.startTag = startTag
-        self.endTag = endTag
+    public init(codeType: String, codeBlock: String = "```") {
+        self.codeType = codeType
+        self.codeBlock = codeBlock
+        self.startTag = codeBlock + codeType
+        self.endTag = nil
     }
 
     public func parse(content: String, tools: [[String: any Sendable]]?) -> ToolCall? {
-        guard let start = startTag, let end = endTag else { return nil }
+        guard let start = startTag, let type = codeType, let end = codeBlock else { return nil }
 
         // Find the JSON content between tags
         var text = content
@@ -22,6 +26,9 @@ public struct JSONToolCallParser: ToolCallParser, Sendable {
         // Strip tags if present
         if let startRange = text.range(of: start) {
             text = String(text[startRange.upperBound...])
+        }
+        if let codeRange = text.range(of: type) {
+            text = String(text[codeRange.upperBound...])
         }
         if let endRange = text.range(of: end) {
             text = String(text[..<endRange.lowerBound])

@@ -124,7 +124,7 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         case .json:
             return JSONToolCallParser(startTag: "<tool_call>", endTag: "</tool_call>")
         case .qwen2:
-            return JSONToolCallParser(startTag: "```json", endTag: "```")
+            return CodeBlockToolCallParser(codeType: "json")
         case .lfm2:
             return PythonicToolCallParser(
                 startTag: "<|tool_call_start|>", endTag: "<|tool_call_end|>")
@@ -135,7 +135,7 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         case .gemma:
             return GemmaFunctionParser()
         case .gemma3:
-            return JSONToolCallParser(startTag: "```tool_code", endTag: "```")
+            return CodeBlockToolCallParser(codeType: "tool_code")
         case .gemma4:
             return GemmaFunctionParser(
                 startTag: "<|tool_call>", endTag: "<tool_call|>", escapeMarker: "<|\"|>")
