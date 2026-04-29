@@ -67,7 +67,7 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     case json
 
     /// Qwen2.5 Instuct (Coder) won't wrap tool calls in <tool_code/>
-    case qwen25
+    case qwen2
 
     /// LFM2/LFM2.5 Pythonic format with model-specific tags.
     /// Example: `<|tool_call_start|>[func(arg='value')]<|tool_call_end|>`
@@ -123,7 +123,7 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         switch self {
         case .json:
             return JSONToolCallParser(startTag: "<tool_call>", endTag: "</tool_call>")
-        case .qwen25:
+        case .qwen2:
             return JSONToolCallParser(startTag: "```json", endTag: "```")
         case .lfm2:
             return PythonicToolCallParser(
@@ -243,7 +243,7 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
 
         /// Qwen2.5 Instuct (Coder) won't wrap tool calls in <tool_code/>
         if type.hasPrefix("qwen2") {
-            return .qwen25
+            return .qwen2
         }
 
         // DeepSeek-V4 — `DSML` markup format. Per
@@ -283,6 +283,9 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         }
 
         switch n {
+        // Qwen 2, Qwen2.5
+        case "qwen2":
+            return .qwen2
         // Qwen 3.5 / 3.6 family — XML-style <tool_call>…</tool_call>
         // (vLLM ecosystem name `qwen3_coder` aliased here).
         case "qwen", "qwen3", "qwen3_5", "qwen35", "qwen3_6", "qwen36",
