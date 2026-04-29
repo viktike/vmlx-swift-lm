@@ -35,6 +35,7 @@ public struct CodeBlockToolCallParser: ToolCallParser, Sendable {
         }
 
         let jsonStr = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        NSLog("Trying to parse tool call JSON: '\(jsonStr)' between in code block with type: \(type)")
 
         guard
             let data = jsonStr.data(using: .utf8),

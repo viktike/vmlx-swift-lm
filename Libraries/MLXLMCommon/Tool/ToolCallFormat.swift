@@ -123,9 +123,9 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         switch self {
         case .json:
             return JSONToolCallParser(startTag: "<tool_call>", endTag: "</tool_call>")
-        case .qwen2:
-            return JSONToolCallParser(startTag: "```json", endTag: "\n```")
-        //  return CodeBlockToolCallParser(codeType: "json")
+        case .qwen2:  
+            return CodeBlockToolCallParser(codeType: "json")
+        //  return JSONToolCallParser(startTag: "```json", endTag: "\n```")
         case .lfm2:
             return PythonicToolCallParser(
                 startTag: "<|tool_call_start|>", endTag: "<|tool_call_end|>")
