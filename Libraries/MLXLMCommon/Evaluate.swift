@@ -695,6 +695,9 @@ public struct TokenIterator: TokenIteratorProtocol {
     ) throws {
         self.model = model
         self.y = .init(tokens: prompt)
+        if cache == nil {
+            NSLog("Creating cache with parameters: \(parameters.kvMode)")
+        }
         self.cache = cache ?? model.newCache(parameters: parameters)
 
         self.processor = parameters.processor()
@@ -706,6 +709,8 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.quantizedKVStart = parameters.quantizedKVStart
         self.kvMode = parameters.kvMode
 
+        maybeQuantizeKVCache(cache: &self.cache, kvBits: self.kvBits, kvGroupSize: self.kvGroupSize, quantizedKVStart: self.quantizedKVStart, kvMode: self.kvMode)
+        
         self.cacheCoordinator = nil
         self.promptTokenIds = []
         self.mediaSalt = nil
@@ -735,22 +740,11 @@ public struct TokenIterator: TokenIteratorProtocol {
     ) throws {
         self.model = model
         self.y = input.text
+
         if cache == nil {
             NSLog("Creating cache with parameters: \(parameters.kvMode)")
         }
         self.cache = cache ?? model.newCache(parameters: parameters)
-
-        if let cacheArray = self.cache as? [any KVCache] {
-            NSLog("Model'number of layer caches: \(cacheArray.count)")
-            
-            for (i, layerCache) in cacheArray.enumerated() {
-                let typeName = String(describing: type(of: layerCache))
-                NSLog("Layer \(i): \(typeName)")
-                if let q = layerCache as? any QuantizedKVCacheProtocol {
-                    NSLog("Layer \(i): Conforms to QuantizedKVCacheProtocol")
-                }
-            }
-        }
 
         self.cacheCoordinator = cacheCoordinator
 
@@ -763,6 +757,8 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.quantizedKVStart = parameters.quantizedKVStart
         self.kvMode = parameters.kvMode
 
+        maybeQuantizeKVCache(cache: &self.cache, kvBits: self.kvBits, kvGroupSize: self.kvGroupSize, quantizedKVStart: self.quantizedKVStart, kvMode: self.kvMode)
+        
         // Capture prompt token IDs for cache store after generation.
         let tokenCount = input.text.tokens.size
         if tokenCount > 0 {
