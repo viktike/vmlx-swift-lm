@@ -1682,7 +1682,10 @@ public func maybeQuantizeKVCache(
     quantizedKVStart: Int = 0,
     kvMode: KVQuantizationMode = .none
 ) {
-    guard !cache.isEmpty else { return }
+    guard !cache.isEmpty else {
+        NSLog("[Quantization] Empty cache array provided to maybeQuantizeKVCache - skipping quantization/compression")
+        return
+    }
 
     // Find the first quantizable (KVCacheSimple) layer to check offset threshold.
     // Hybrid models may have MambaCache/RotatingKVCache at layer 0, so we can't
@@ -1699,7 +1702,10 @@ public func maybeQuantizeKVCache(
         let tqMinStart = max(quantizedKVStart, 8)
         guard !cache.contains(where: { $0 is TurboQuantKVCache }),
               let ref = firstSimple, ref.offset > tqMinStart
-        else { return }
+        else {
+            NSLog("[Quantization] TurboQuant already compressed (or quantizedKVStart not reached)")
+            return
+        }
 
         for i in 0..<cache.count {
             if let simpleCache = cache[i] as? KVCacheSimple {
@@ -1709,21 +1715,27 @@ public func maybeQuantizeKVCache(
             // RotatingKVCache, MambaCache, CacheList: skip (no KV to compress,
             // or already manages its own memory)
         }
+        NSLog("[Quantization] TurboQuant is compressing...")
         return
 
     case .affine(let bits, let groupSize):
         guard !cache.contains(where: { $0 is QuantizedKVCache }),
               let ref = firstSimple, ref.offset > quantizedKVStart
-        else { return }
+        else {
+            NSLog("[Quantization] Affine compression already applied (or quantizedKVStart not reached)")
+            return
+        }
 
         for i in 0..<cache.count {
             if let simpleCache = cache[i] as? KVCacheSimple {
                 cache[i] = simpleCache.toQuantized(groupSize: groupSize, bits: bits)
             }
         }
+        NSLog("[Quantization] Affine is quantizing...")
         return
 
     case .none:
+        NSLog("[Quantization] disabled.")
         break
     }
 
@@ -1732,6 +1744,7 @@ public func maybeQuantizeKVCache(
         !cache.contains(where: { $0 is QuantizedKVCache }),
         let ref = firstSimple, ref.offset > quantizedKVStart
     else {
+        NSLog("[Quantization] Legacy affine compression path not taken (or quantizedKVStart not reached)")
         return
     }
 
@@ -1740,4 +1753,5 @@ public func maybeQuantizeKVCache(
             cache[i] = simpleCache.toQuantized(groupSize: kvGroupSize, bits: kvBits)
         }
     }
+    NSLog("[Quantization] Legacy affine is quantizing...")
 }
