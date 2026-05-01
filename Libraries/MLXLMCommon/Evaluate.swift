@@ -739,7 +739,19 @@ public struct TokenIterator: TokenIteratorProtocol {
             NSLog("Creating cache with parameters: \(parameters.kvMode)")
         }
         self.cache = cache ?? model.newCache(parameters: parameters)
-        NSLog("Cache is of type: \(type(of: self.cache))")
+
+        if let cacheArray = self.cache as? [any KVCache] {
+            NSLog("Model'number of layer caches: \(cacheArray.count)")
+            
+            for (i, layerCache) in cacheArray.enumerated() {
+                let typeName = String(describing: type(of: layerCache))
+                NSLog("Layer \(i): \(typeName)")
+                if let q = layerCache as? any QuantizedKVCacheProtocol {
+                    NSLog("Layer \(i): Conforms to QuantizedKVCacheProtocol")
+                }
+            }
+        }
+
         self.cacheCoordinator = cacheCoordinator
 
         self.processor = parameters.processor()
