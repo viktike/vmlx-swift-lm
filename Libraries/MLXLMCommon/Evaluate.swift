@@ -739,6 +739,7 @@ public struct TokenIterator: TokenIteratorProtocol {
             NSLog("Creating cache with parameters: \(parameters.kvMode)")
         }
         self.cache = cache ?? model.newCache(parameters: parameters)
+        NSLog("Cache is of type: \(type(of: self.cache))")
         self.cacheCoordinator = cacheCoordinator
 
         self.processor = parameters.processor()
@@ -1703,9 +1704,11 @@ public func generate(
     {
         return stream
     }
+    /**
     if cache == nil {
         NSLog("No cache yet, parameters suggest \(parameters.kvMode)")
     }
+    **/
     let iterator = try TokenIterator(
         input: input, model: context.model, cache: cache, parameters: parameters,
         cacheCoordinator: cacheCoordinator)
