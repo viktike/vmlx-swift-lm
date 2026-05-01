@@ -1711,7 +1711,7 @@ public func maybeQuantizeKVCache(
                     simpleCache, keyBits: keyBits, valueBits: valueBits)
 
                 let typeName = String(describing: type(of: cache[i]))
-                NSLog("[Quantization] Converted cache layer \(i) to \(typeName)")
+                // NSLog("[Quantization] Converted cache layer \(i) to \(typeName)")
             }
             // RotatingKVCache, MambaCache, CacheList: skip (no KV to compress,
             // or already manages its own memory)
@@ -1729,7 +1729,7 @@ public func maybeQuantizeKVCache(
             if let simpleCache = cache[i] as? KVCacheSimple {
                 cache[i] = simpleCache.toQuantized(groupSize: groupSize, bits: bits)
                 let typeName = String(describing: type(of: cache[i]))
-                NSLog("[Quantization] Converted cache layer \(i) to \(typeName)")
+                // NSLog("[Quantization] Converted cache layer \(i) to \(typeName)")
             }
         }
         return

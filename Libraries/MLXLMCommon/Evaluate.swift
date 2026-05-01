@@ -695,9 +695,7 @@ public struct TokenIterator: TokenIteratorProtocol {
     ) throws {
         self.model = model
         self.y = .init(tokens: prompt)
-        if cache == nil {
-            NSLog("Creating cache with parameters: \(parameters.kvMode)")
-        }
+
         self.cache = cache ?? model.newCache(parameters: parameters)
 
         self.processor = parameters.processor()
@@ -709,11 +707,14 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.quantizedKVStart = parameters.quantizedKVStart
         self.kvMode = parameters.kvMode
 
-        maybeQuantizeKVCache(cache: &self.cache, kvBits: self.kvBits, kvGroupSize: self.kvGroupSize, quantizedKVStart: self.quantizedKVStart, kvMode: self.kvMode)
-        NSLog("Number of model's cached layers: \(self.cache.count)")
-        for (i, layerCache) in self.cache.enumerated() {
-            let typeName = String(describing: type(of: layerCache))
-            NSLog("Layer \(i): \(typeName)")
+        if case .turboQuant(_, _) = parameters.kvMode {
+            maybeQuantizeKVCache(
+                cache: &self.cache,
+                kvBits: self.kvBits,
+                kvGroupSize: self.kvGroupSize,
+                quantizedKVStart: self.quantizedKVStart,
+                kvMode: self.kvMode
+            )
         }
 
         self.cacheCoordinator = nil
@@ -746,9 +747,6 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.model = model
         self.y = input.text
 
-        if cache == nil {
-            NSLog("Creating cache with parameters: \(parameters.kvMode)")
-        }
         self.cache = cache ?? model.newCache(parameters: parameters)
 
         self.cacheCoordinator = cacheCoordinator
@@ -762,12 +760,28 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.quantizedKVStart = parameters.quantizedKVStart
         self.kvMode = parameters.kvMode
 
-        maybeQuantizeKVCache(cache: &self.cache, kvBits: self.kvBits, kvGroupSize: self.kvGroupSize, quantizedKVStart: self.quantizedKVStart, kvMode: self.kvMode)
+        // If TurboQuant mode, it's fine, to quantize the KV cache during prefill as well.
+        // The legacy (affine) quantization however have massive performance impact on prefill,
+        // also the group size based metadata would negate the memory savings benefits.
+        // Of course, the "none" case is the default, KVCacheSimple type layers.
+        if case .turboQuant(_, _) = parameters.kvMode {
+            maybeQuantizeKVCache(
+                cache: &self.cache,
+                kvBits: self.kvBits,
+                kvGroupSize: self.kvGroupSize,
+                quantizedKVStart: self.quantizedKVStart,
+                kvMode: self.kvMode
+            )
+        }
+
+        /**
+        // KVCache LayerMap for debugging.
         NSLog("Number of model's cached layers: \(self.cache.count)")
         for (i, layerCache) in self.cache.enumerated() {
             let typeName = String(describing: type(of: layerCache))
             NSLog("Layer \(i): \(typeName)")
         }
+        **/
 
         // Capture prompt token IDs for cache store after generation.
         let tokenCount = input.text.tokens.size
