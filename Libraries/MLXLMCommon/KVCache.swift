@@ -1687,6 +1687,8 @@ public func maybeQuantizeKVCache(
         return
     }
 
+    NSLog("[Quantization] maybeQuantizeKVCache called")
+
     // Find the first quantizable (KVCacheSimple) layer to check offset threshold.
     // Hybrid models may have MambaCache/RotatingKVCache at layer 0, so we can't
     // just check cache[0].
@@ -1710,6 +1712,9 @@ public func maybeQuantizeKVCache(
             if let simpleCache = cache[i] as? KVCacheSimple {
                 cache[i] = TurboQuantKVCache.fromSimpleCache(
                     simpleCache, keyBits: keyBits, valueBits: valueBits)
+
+                let typeName = String(describing: type(of: cache[i]))
+                NSLog("[Quantization] Converted cache layer \(i) to \(typeName)")
             }
             // RotatingKVCache, MambaCache, CacheList: skip (no KV to compress,
             // or already manages its own memory)
@@ -1726,6 +1731,8 @@ public func maybeQuantizeKVCache(
         for i in 0..<cache.count {
             if let simpleCache = cache[i] as? KVCacheSimple {
                 cache[i] = simpleCache.toQuantized(groupSize: groupSize, bits: bits)
+                let typeName = String(describing: type(of: cache[i]))
+                NSLog("[Quantization] Converted cache layer \(i) to \(typeName)")
             }
         }
         return
