@@ -1703,7 +1703,6 @@ public func maybeQuantizeKVCache(
         guard !cache.contains(where: { $0 is TurboQuantKVCache }),
               let ref = firstSimple, ref.offset > tqMinStart
         else {
-            NSLog("[Quantization] TurboQuant already compressed (or quantizedKVStart not reached)")
             return
         }
 
@@ -1715,14 +1714,12 @@ public func maybeQuantizeKVCache(
             // RotatingKVCache, MambaCache, CacheList: skip (no KV to compress,
             // or already manages its own memory)
         }
-        NSLog("[Quantization] TurboQuant is compressing...")
         return
 
     case .affine(let bits, let groupSize):
         guard !cache.contains(where: { $0 is QuantizedKVCache }),
               let ref = firstSimple, ref.offset > quantizedKVStart
         else {
-            NSLog("[Quantization] Affine compression already applied (or quantizedKVStart not reached)")
             return
         }
 
@@ -1731,11 +1728,9 @@ public func maybeQuantizeKVCache(
                 cache[i] = simpleCache.toQuantized(groupSize: groupSize, bits: bits)
             }
         }
-        NSLog("[Quantization] Affine is quantizing...")
         return
 
     case .none:
-        NSLog("[Quantization] disabled.")
         break
     }
 
@@ -1744,7 +1739,6 @@ public func maybeQuantizeKVCache(
         !cache.contains(where: { $0 is QuantizedKVCache }),
         let ref = firstSimple, ref.offset > quantizedKVStart
     else {
-        NSLog("[Quantization] Legacy affine compression path not taken (or quantizedKVStart not reached)")
         return
     }
 
@@ -1753,5 +1747,4 @@ public func maybeQuantizeKVCache(
             cache[i] = simpleCache.toQuantized(groupSize: kvGroupSize, bits: kvBits)
         }
     }
-    NSLog("[Quantization] Legacy affine is quantizing...")
 }
