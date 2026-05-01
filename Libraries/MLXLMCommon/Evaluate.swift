@@ -710,6 +710,11 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.kvMode = parameters.kvMode
 
         maybeQuantizeKVCache(cache: &self.cache, kvBits: self.kvBits, kvGroupSize: self.kvGroupSize, quantizedKVStart: self.quantizedKVStart, kvMode: self.kvMode)
+        NSLog("Number of model's cached layers: \(self.cache.count)")
+        for (i, layerCache) in self.cache.enumerated() {
+            let typeName = String(describing: type(of: layerCache))
+            NSLog("Layer \(i): \(typeName)")
+        }
 
         self.cacheCoordinator = nil
         self.promptTokenIds = []
@@ -758,6 +763,11 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.kvMode = parameters.kvMode
 
         maybeQuantizeKVCache(cache: &self.cache, kvBits: self.kvBits, kvGroupSize: self.kvGroupSize, quantizedKVStart: self.quantizedKVStart, kvMode: self.kvMode)
+        NSLog("Number of model's cached layers: \(self.cache.count)")
+        for (i, layerCache) in self.cache.enumerated() {
+            let typeName = String(describing: type(of: layerCache))
+            NSLog("Layer \(i): \(typeName)")
+        }
 
         // Capture prompt token IDs for cache store after generation.
         let tokenCount = input.text.tokens.size

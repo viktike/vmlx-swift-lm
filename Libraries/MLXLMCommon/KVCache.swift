@@ -1687,8 +1687,6 @@ public func maybeQuantizeKVCache(
         return
     }
 
-    NSLog("[Quantization] maybeQuantizeKVCache called")
-
     // Find the first quantizable (KVCacheSimple) layer to check offset threshold.
     // Hybrid models may have MambaCache/RotatingKVCache at layer 0, so we can't
     // just check cache[0].
@@ -1701,9 +1699,8 @@ public func maybeQuantizeKVCache(
         // TQ has a minimum threshold of 8 tokens — compressing fewer tokens
         // than sink tokens (4) + a small buffer is wasteful and produces
         // degenerate compressed representations.
-        let tqMinStart = max(quantizedKVStart, 8)
         guard !cache.contains(where: { $0 is TurboQuantKVCache }),
-              let ref = firstSimple, ref.offset > tqMinStart
+              let ref = firstSimple, ref.offset >= quantizedKVStart
         else {
             return
         }
@@ -1723,7 +1720,7 @@ public func maybeQuantizeKVCache(
 
     case .affine(let bits, let groupSize):
         guard !cache.contains(where: { $0 is QuantizedKVCache }),
-              let ref = firstSimple, ref.offset > quantizedKVStart
+              let ref = firstSimple, ref.offset >= quantizedKVStart
         else {
             return
         }
@@ -1744,7 +1741,7 @@ public func maybeQuantizeKVCache(
     // Legacy path: use kvBits if set
     guard let kvBits = kvBits,
         !cache.contains(where: { $0 is QuantizedKVCache }),
-        let ref = firstSimple, ref.offset > quantizedKVStart
+        let ref = firstSimple, ref.offset >= quantizedKVStart
     else {
         return
     }
