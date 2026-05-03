@@ -1048,6 +1048,11 @@ public class GlmOcr: Module, VLMModel, KVCacheDimensionProvider {
             inputIds: input.text.tokens, pixelValues: allPixels,
             frames: allFrames.isEmpty ? nil : allFrames)
 
+        // Clear stored M-RoPE position IDs and deltas
+        // Position IDs are computed fresh in getRopeIndex based on current input and cache state
+        languageModel._positionIds = nil
+        languageModel._ropeDeltas = nil
+
         let result = languageModel(nil, cache: cache, inputEmbedding: inputEmbeddings)
 
         return .logits(result)
