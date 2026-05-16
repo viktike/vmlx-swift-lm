@@ -1004,7 +1004,6 @@ public class GlmOcr: Module, VLMModel, KVCacheDimensionProvider {
         -> MLXArray
     {
         guard let pixelValues, let frames else {
-            // Text-only input: no image features, use sequential positions
             languageModel._positionIds = nil
             languageModel._ropeDeltas = nil
             return languageModel.model.embedTokens(inputIds[.newAxis, .ellipsis])
@@ -1023,8 +1022,12 @@ public class GlmOcr: Module, VLMModel, KVCacheDimensionProvider {
             imageTokenId: config.baseConfiguration.imageTokenId,
             videoTokenId: config.baseConfiguration.videoTokenId)
 
-        // Don't pre-compute M-RoPE position IDs here - let the language model compute them
-        // based on cache state to ensure correct shape for restored cache
+        // Pre-compute M-RoPE position IDs
+        let (positionIds, ropeDeltas) = getRopeIndex(
+            inputIds: inputIds, imageGridThw: frames)
+        languageModel._positionIds = positionIds
+        languageModel._ropeDeltas = ropeDeltas
+
         return merged
     }
 
@@ -1044,6 +1047,11 @@ public class GlmOcr: Module, VLMModel, KVCacheDimensionProvider {
         let inputEmbeddings = self.inputEmbeddings(
             inputIds: input.text.tokens, pixelValues: allPixels,
             frames: allFrames.isEmpty ? nil : allFrames)
+
+        // Clear stored M-RoPE position IDs and deltas
+        // Position IDs are computed fresh in getRopeIndex based on current input and cache state
+        languageModel._positionIds = nil
+        languageModel._ropeDeltas = nil
 
         let result = languageModel(nil, cache: cache, inputEmbedding: inputEmbeddings)
 
