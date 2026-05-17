@@ -685,11 +685,18 @@ public struct NemotronHOmniProcessor: UserInputProcessor {
             Self.prependMedia(media, toLastUserIn: &messages)
         }
 
-        let promptTokens = try tokenizer.applyChatTemplate(
+        var promptTokens = try tokenizer.applyChatTemplate(
             messages: messages, tools: input.tools,
             additionalContext: input.additionalContext)
+        promptTokens = try normalizeMediaPlaceholders(promptTokens)
+
         let promptArray = MLXArray(promptTokens).expandedDimensions(axis: 0)
         let mask = ones(like: promptArray).asType(.int8)
+
+        let imageTokenId = tokenizer.convertTokenToId("<image>")
+            ?? Self.imageContextTokenId
+        let soundTokenId = tokenizer.convertTokenToId("<so_embedding>")
+            ?? Self.soundContextTokenId
 
         return LMInput(
             text: .init(tokens: promptArray, mask: mask),
@@ -698,7 +705,7 @@ public struct NemotronHOmniProcessor: UserInputProcessor {
             audio: processedAudio,
             mediaTokenIds: media.isEmpty
                 ? nil
-                : [Self.imageContextTokenId, Self.soundContextTokenId],
+                : [imageTokenId, soundTokenId],
             cacheScopeSalt: cacheScopeSalt(from: input.additionalContext))
     }
 
@@ -756,5 +763,50 @@ public struct NemotronHOmniProcessor: UserInputProcessor {
             }.joined(separator: "\n")
         }
         return value.map { String(describing: $0) } ?? ""
+    }
+
+    private func normalizeMediaPlaceholders(_ promptTokens: [Int]) throws -> [Int] {
+        let decoded = tokenizer.decode(tokenIds: promptTokens, skipSpecialTokens: false)
+        var normalizedTokens = promptTokens
+
+        if decoded.contains("<image>") {
+            normalizedTokens = try expandPlaceholder(
+                promptTokens: normalizedTokens,
+                placeholder: "<image>",
+                placeholderTokenId: tokenizer.convertTokenToId("<image>")
+                    ?? Self.imageContextTokenId)
+        }
+        if decoded.contains("<so_embedding>") {
+            normalizedTokens = try expandPlaceholder(
+                promptTokens: normalizedTokens,
+                placeholder: "<so_embedding>",
+                placeholderTokenId: tokenizer.convertTokenToId("<so_embedding>")
+                    ?? Self.soundContextTokenId)
+        }
+
+        return normalizedTokens
+    }
+
+    private func expandPlaceholder(
+        promptTokens: [Int],
+        placeholder: String,
+        placeholderTokenId: Int
+    ) throws -> [Int] {
+        let decoded = tokenizer.decode(tokenIds: promptTokens, skipSpecialTokens: false)
+        let pieces = decoded.components(separatedBy: placeholder)
+        guard pieces.count > 1 else { return promptTokens }
+
+        var expandedTokens: [Int] = []
+        for (index, piece) in pieces.enumerated() {
+            if !piece.isEmpty {
+                let pieceTokens = tokenizer.encode(text: piece, addSpecialTokens: false)
+                expandedTokens.append(contentsOf: pieceTokens)
+            }
+            if index < pieces.count - 1 {
+                expandedTokens.append(placeholderTokenId)
+            }
+        }
+
+        return expandedTokens
     }
 }
