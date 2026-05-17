@@ -214,18 +214,59 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
         let textEmbeds = languageModel.embedTokens(input.text.tokens)
         var spliced = textEmbeds
         
+        // Track which modalities we have to process
+        let hasImage = input.image != nil
+        let hasAudio = input.audio != nil
+        
+        // If no media at all, skip multimodal processing
+        if !hasImage && !hasAudio {
+            let logits = languageModel.callAsFunction(
+                inputsEmbeds: spliced, cache: convertedCache)
+            return .logits(LMOutput(logits: logits))
+        }
+        
         // Extract placeholder token IDs from the input. The processor set these
         // based on actual tokenizer output, ensuring consistency.
-        guard let mediaTokenIds = input.mediaTokenIds, mediaTokenIds.count >= 2 else {
+        //
+        // We need to handle the case where only some modalities are present:
+        // - If only image is provided: mediaTokenIds = [imageTokenId]
+        // - If only audio is provided: mediaTokenIds = [soundTokenId]
+        // - If both are provided: mediaTokenIds = [imageTokenId, soundTokenId]
+        guard let mediaTokenIds = input.mediaTokenIds else {
             // No media tokens declared; skip multimodal splice
             let logits = languageModel.callAsFunction(
                 inputsEmbeds: spliced, cache: convertedCache)
             return .logits(LMOutput(logits: logits))
         }
-        let imageTokenId = mediaTokenIds[0]
-        let soundTokenId = mediaTokenIds[1]
         
-        // Image and video share the same `<image>` placeholder per Python
+        // Determine the token IDs for each modality based on what was actually provided
+        let numMediaTypes = ( hasImage ? 1 : 0 ) + ( hasAudio ? 1 : 0 )
+        if numMediaTypes == 0 {
+            // No media provided; skip multimodal splice
+            let logits = languageModel.callAsFunction(
+                inputsEmbeds: spliced, cache: convertedCache)
+            return .logits(LMOutput(logits: logits))
+        }
+        
+        var imageTokenId = 0
+        var soundTokenId = 0
+        // If both image and audio are provided, we need both token IDs
+        if numMediaTypes == 2 {
+            // Use the first two token IDs from mediaTokenIds
+            imageTokenId = mediaTokenIds[0]
+            soundTokenId = mediaTokenIds[1]
+        } else {
+            // Only one modality type is provided
+            if hasImage {
+                // Only image provided
+                imageTokenId = mediaTokenIds[0]
+            } else if hasAudio {
+                // Only audio provided
+                soundTokenId = mediaTokenIds[0]
+            }
+        }
+        
+        // Image and video share the same<image>` placeholder per Python
         // model.py (img_context_token_id is reused for both — the
         // distinguishing factor is which tower produced the embedding).
         // The processor emits placeholders in image-first-then-video order
@@ -731,14 +772,22 @@ public struct NemotronHOmniProcessor: UserInputProcessor {
         let promptArray = MLXArray(promptTokens).expandedDimensions(axis: 0)
         let mask = ones(like: promptArray).asType(.int8)
 
+        // Set mediaTokenIds based on whether any media was processed, not just whether
+        // the media string is non-empty. This ensures that images/videos/audio provided
+        // via input.images/input.videos/input.audios are properly handled.
+        let mediaTokenIds: [Int]?
+        if totalImageTokens > 0 || totalVideoTokens > 0 || totalAudioTokens > 0 {
+            mediaTokenIds = [imageTokenId, soundTokenId]
+        } else {
+            mediaTokenIds = nil
+        }
+
         return LMInput(
             text: .init(tokens: promptArray, mask: mask),
             image: processedImage,
             video: processedVideo,
             audio: processedAudio,
-            mediaTokenIds: media.isEmpty
-                ? nil
-                : [imageTokenId, soundTokenId],
+            mediaTokenIds: mediaTokenIds,
             cacheScopeSalt: cacheScopeSalt(from: input.additionalContext))
     }
 
