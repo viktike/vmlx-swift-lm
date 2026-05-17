@@ -56,18 +56,23 @@ extension LLMModel {
         // Prepare the prompt in chunks if larger than the prefill size.
         // Clear Metal cache between chunks to reduce memory pressure,
         // matching Python mlx-lm behavior. Critical for MoE models.
+        // asyncEval lets the CPU build chunk N+1's graph while the GPU evaluates
+        // chunk N.
         while flatTokens.size > prefillStepSize {
             // Build a [1, prefillStepSize] chunk for the model forward pass.
             let chunkTokens = flatTokens[..<prefillStepSize][.newAxis, 0...]
             let chunkMask = flatMask.map { $0[..<prefillStepSize] }
             let chunkText = LMInput.Text(tokens: chunkTokens, mask: chunkMask)
             _ = self(chunkText, cache: cache.isEmpty ? nil : cache, state: nil)
-            MLX.eval(cache)
+            MLX.asyncEval(cache)
             flatTokens = flatTokens[prefillStepSize...]
             if let m = flatMask { flatMask = m[prefillStepSize...] }
             Memory.clearCache()
         }
 
+        // Single sync after the loop to flush any remaining async work.
+        MLX.eval(cache)
+        
         // Return the remainder as a 1D `[T]` tensor regardless of the
         // caller's original rank. Downstream consumers —
         // `TokenIterator.step(previous:)` and
