@@ -137,6 +137,24 @@ public struct UserInput {
         }
     }
 
+    /// Representation of an audio resource (mono PCM, model handles
+    /// resampling to its required rate). Used by speech-aware models
+    /// like Nemotron-3-Nano-Omni's Parakeet path.
+    public enum Audio {
+        /// File on disk — any format AVFoundation can decode (.wav, .m4a,
+        /// .mp3, .aac, .mov audio track, etc.). Resampled to the model's
+        /// required rate during `prepare`.
+        case url(URL)
+        /// Pre-loaded Float32 PCM samples + sample rate.
+        case samples([Float], sampleRate: Int)
+        /// Pre-loaded waveform as MLXArray (mono, Float32).
+        case array(MLXArray, sampleRate: Int)
+        /// Pre-loaded Float32 PCM samples plus an already-computed audio
+        /// embedding. Speech-aware models can splice the embedding directly
+        /// and skip their mel/encoder pass for live voice handoff.
+        case preEncoded(samples: [Float], sampleRate: Int, embedding: MLXArray)
+    }
+
     /// Representation of processing to apply to media.
     public struct Processing: Sendable {
         public var resize: CGSize?
@@ -161,6 +179,9 @@ public struct UserInput {
                 self.videos = messages.reduce(into: []) { result, message in
                     result.append(contentsOf: message.videos)
                 }
+                self.audios = messages.reduce(into: []) { result, message in
+                    result.append(contentsOf: message.audios)
+                }
             }
         }
     }
@@ -176,6 +197,13 @@ public struct UserInput {
     /// If the ``prompt-swift.property`` is a ``Prompt-swift.enum/chat(_:)`` this will
     /// collect the videos from the chat messages, otherwise these are the stored videos with the ``UserInput``.
     public var videos = [Video]()
+
+    /// The audio resources associated with the `UserInput`. Used by
+    /// speech-aware models (Nemotron-3-Nano-Omni Parakeet path).
+    /// Stays empty for non-audio models — the per-model
+    /// ``UserInputProcessor`` is responsible for decoding into
+    /// ``LMInput/ProcessedAudio`` when applicable.
+    public var audios = [Audio]()
 
     public var tools: [ToolSpec]?
 
@@ -196,11 +224,12 @@ public struct UserInput {
     /// - ``init(chat:tools:additionalContext:)``
     public init(
         prompt: String, images: [Image] = [Image](), videos: [Video] = [Video](),
+        audios: [Audio] = [Audio](),
         tools: [ToolSpec]? = nil,
         additionalContext: [String: any Sendable]? = nil
     ) {
         self.prompt = .chat([
-            .user(prompt, images: images, videos: videos)
+            .user(prompt, images: images, videos: videos, audios: audios)
         ])
         self.tools = tools
         self.additionalContext = additionalContext
@@ -212,6 +241,7 @@ public struct UserInput {
         // without these assignments. Matches what the `didSet` clause does.
         self.images = images
         self.videos = videos
+        self.audios = audios
     }
 
     /// Initialize the `UserInput` with model specific mesage structures.
@@ -249,12 +279,14 @@ public struct UserInput {
     /// - ``init(chat:tools:additionalContext:)``
     public init(
         messages: [Message], images: [Image] = [Image](), videos: [Video] = [Video](),
+        audios: [Audio] = [Audio](),
         tools: [ToolSpec]? = nil,
         additionalContext: [String: any Sendable]? = nil
     ) {
         self.prompt = .messages(messages)
         self.images = images
         self.videos = videos
+        self.audios = audios
         self.tools = tools
         self.additionalContext = additionalContext
     }
@@ -297,7 +329,9 @@ public struct UserInput {
         self.videos = chat.reduce(into: []) { result, message in
             result.append(contentsOf: message.videos)
         }
-
+        self.audios = chat.reduce(into: []) { result, message in
+            result.append(contentsOf: message.audios)
+        }
         self.processing = processing
         self.tools = tools
         self.additionalContext = additionalContext
@@ -321,6 +355,7 @@ public struct UserInput {
         prompt: Prompt,
         images: [Image] = [Image](),
         videos: [Video] = [Video](),
+        audios: [Audio] = [Audio](),
         processing: Processing = .init(),
         tools: [ToolSpec]? = nil, additionalContext: [String: any Sendable]? = nil
     ) {
@@ -329,8 +364,17 @@ public struct UserInput {
         case .text, .messages:
             self.images = images
             self.videos = videos
-        case .chat:
-            break
+            self.audios = audios
+        case .chat(let messages):
+            self.images = messages.reduce(into: []) { result, message in
+                result.append(contentsOf: message.images)
+            }
+            self.videos = messages.reduce(into: []) { result, message in
+                result.append(contentsOf: message.videos)
+            }
+            self.audios = messages.reduce(into: []) { result, message in
+                result.append(contentsOf: message.audios)
+            }
         }
         self.processing = processing
         self.tools = tools
