@@ -690,13 +690,34 @@ public struct NemotronHOmniProcessor: UserInputProcessor {
             additionalContext: input.additionalContext)
         promptTokens = try normalizeMediaPlaceholders(promptTokens)
 
-        let promptArray = MLXArray(promptTokens).expandedDimensions(axis: 0)
-        let mask = ones(like: promptArray).asType(.int8)
-
         let imageTokenId = tokenizer.convertTokenToId("<image>")
             ?? Self.imageContextTokenId
         let soundTokenId = tokenizer.convertTokenToId("<so_embedding>")
             ?? Self.soundContextTokenId
+
+        if !media.isEmpty {
+            let hasImagePlaceholder = promptTokens.contains(imageTokenId)
+            let hasSoundPlaceholder = promptTokens.contains(soundTokenId)
+            let bosTokenId = tokenizer.bosToken.flatMap { tokenizer.convertTokenToId($0) }
+            let insertIndex = (bosTokenId != nil && promptTokens.first == bosTokenId) ? 1 : 0
+
+            if totalImageTokens + totalVideoTokens > 0 && !hasImagePlaceholder {
+                promptTokens.insert(
+                    contentsOf: Array(repeating: imageTokenId, count: totalImageTokens + totalVideoTokens),
+                    at: insertIndex)
+            }
+            if totalAudioTokens > 0 && !hasSoundPlaceholder {
+                let soundInsertIndex = promptTokens.firstIndex(of: imageTokenId)
+                    .map { $0 + (totalImageTokens + totalVideoTokens) }
+                    ?? insertIndex
+                promptTokens.insert(
+                    contentsOf: Array(repeating: soundTokenId, count: totalAudioTokens),
+                    at: soundInsertIndex)
+            }
+        }
+
+        let promptArray = MLXArray(promptTokens).expandedDimensions(axis: 0)
+        let mask = ones(like: promptArray).asType(.int8)
 
         return LMInput(
             text: .init(tokens: promptArray, mask: mask),
@@ -799,7 +820,7 @@ public struct NemotronHOmniProcessor: UserInputProcessor {
         var expandedTokens: [Int] = []
         for (index, piece) in pieces.enumerated() {
             if !piece.isEmpty {
-                let pieceTokens = tokenizer.encode(text: piece, addSpecialTokens: false)
+                let pieceTokens = tokenizer.encode(text: piece)
                 expandedTokens.append(contentsOf: pieceTokens)
             }
             if index < pieces.count - 1 {
