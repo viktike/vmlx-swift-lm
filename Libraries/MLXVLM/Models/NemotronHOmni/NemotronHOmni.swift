@@ -392,7 +392,12 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
             } else {
                 // Treat as LLM weight — strip any leading "language_model." (rare)
                 // and forward to NemotronHModel.sanitize via a fresh dict.
-                llmKeys[k] = v
+                if k.hasPrefix("language_model.") {
+                    let stripped = String(k.dropFirst("language_model.".count))
+                    llmKeys[stripped] = v
+                } else {
+                    llmKeys[k] = v
+                }
             }
         }
 
