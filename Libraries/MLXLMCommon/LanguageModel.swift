@@ -61,6 +61,23 @@ public struct LMInput {
     public let text: Text
     public let image: ProcessedImage?
     public let video: ProcessedVideo?
+    public let audio: ProcessedAudio?
+    public let mediaTokenIds: [Int]?
+
+    /// Optional request-scope cache-key salt independent of media bytes.
+    ///
+    /// Set by VLM/LM processors when the request carries a runtime flag
+    /// that changes prompt rendering or model behavior in a way the
+    /// token list alone cannot distinguish — most importantly the
+    /// reasoning on/off split for thinking-capable bundles. The
+    /// canonical encoding today is `"reasoning=on"` / `"reasoning=off"`,
+    /// but the field is intentionally `String?` so future flags can be
+    /// composed without changing the type.
+    ///
+    /// Combined with the media-bytes fingerprint by
+    /// `computeCacheSalt(for:)` to form the final per-request cache
+    /// salt that the coordinator mixes into its block hash.
+    public let cacheScopeSalt: String?
 
     /// Representation of tokenized input text.
     public struct Text {
@@ -120,17 +137,89 @@ public struct LMInput {
         }
     }
 
-    public init(tokens: MLXArray, mask: MLXArray? = nil) {
-        self.init(text: .init(tokens: tokens, mask: mask))
+    /// Representation of prepared input audio for speech-aware models
+    /// (Nemotron-3-Nano-Omni Parakeet path, future ASR-conditioned VLMs).
+    ///
+    /// ``waveform`` is a Float32 mono PCM tensor at ``sampleRate`` Hz —
+    /// the model encodes it via its own mel STFT + audio encoder during
+    /// `prepare(_:cache:windowSize:)`. The tensor format is intentionally
+    /// minimal so different audio-encoder front-ends (Parakeet,
+    /// Whisper-style log-mel, raw waveform encoders) can each consume
+    /// the same `LMInput.audio` field.
+    public struct ProcessedAudio {
+
+        /// Mono Float32 PCM samples. Shape `[1, samples]` or `[samples]`.
+        public let waveform: MLXArray
+
+        /// Sampling rate of `waveform` in Hz. Models may resample
+        /// internally if their encoder requires a different rate.
+        public let sampleRate: Int
+
+        /// Optional pre-encoded embedding `[frames, hidden]`. When
+        /// supplied the model SHOULD skip its mel/encoder pipeline and
+        /// splice these embeds directly. Used for the
+        /// `extractAudioEmbeds` → manual splice workflow that
+        /// non-omni-aware code can fall back to without paying the
+        /// re-encode cost on every turn.
+        public let preEncodedEmbedding: MLXArray?
+
+        public init(
+            waveform: MLXArray, sampleRate: Int = 16_000,
+            preEncodedEmbedding: MLXArray? = nil
+        ) {
+            self.waveform = waveform
+            self.sampleRate = sampleRate
+            self.preEncodedEmbedding = preEncodedEmbedding
+        }
+    }
+
+    public init(tokens: MLXArray, mask: MLXArray? = nil, cacheScopeSalt: String? = nil) {
+        self.init(
+            text: .init(tokens: tokens, mask: mask),
+            cacheScopeSalt: cacheScopeSalt)
     }
 
     public init(
         text: LMInput.Text, image: LMInput.ProcessedImage? = nil,
-        video: LMInput.ProcessedVideo? = nil
+        video: LMInput.ProcessedVideo? = nil,
+        audio: LMInput.ProcessedAudio? = nil,
+        mediaTokenIds: [Int]? = nil,
+        cacheScopeSalt: String? = nil
     ) {
         self.text = text
         self.image = image
         self.video = video
+        self.audio = audio
+        self.mediaTokenIds = mediaTokenIds
+        self.cacheScopeSalt = cacheScopeSalt
+    }
+}
+
+public extension LMInput {
+    /// True when this prompt carries model-side media embeddings.
+    ///
+    /// Cache restore paths use this to distinguish ordinary text prefixes
+    /// from prompts whose placeholder-token span is backed by image, video,
+    /// or audio tensors. Partial cache hits that split that span must fall
+    /// back to full prefill.
+    var hasMediaContent: Bool {
+        image != nil || video != nil || audio != nil
+    }
+
+    /// True when a cache hit boundary would leave model-side media
+    /// placeholder tokens in the suffix still being prefetched.
+    ///
+    /// `nil` ``mediaTokenIds`` means the processor did not declare its
+    /// placeholder IDs, so media prompts stay on the conservative rollback
+    /// path. Models that do declare IDs can safely resume after the
+    /// placeholder span, while still rolling back if the remaining suffix
+    /// includes any media token.
+    func cacheHitSuffixContainsMediaPlaceholder(_ remainingTokenIds: [Int]) -> Bool {
+        guard hasMediaContent, !remainingTokenIds.isEmpty else { return false }
+        guard let mediaTokenIds else { return true }
+        guard !mediaTokenIds.isEmpty else { return false }
+        let mediaTokenSet = Set(mediaTokenIds)
+        return remainingTokenIds.contains { mediaTokenSet.contains($0) }
     }
 }
 
