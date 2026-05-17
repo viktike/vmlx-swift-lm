@@ -320,8 +320,7 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
     public func extractImageEmbeds(pixelValues: MLXArray, video: Bool = false) -> MLXArray {
         var feats = radioModel(pixelValues, video: video)
         // Strip cls/register tokens (first numClsTokens)
-        // RADIO returns [B, num_cls + num_patches, D], skip first numClsTokens
-        feats = feats[config.visionNumClsTokens...]
+        feats = feats[0..., config.visionNumClsTokens..., 0...]
         // Reshape (N, P, D) → (N, h, w, D) where h=w=sqrt(P)
         let N = feats.dim(0)
         let P = feats.dim(1)
