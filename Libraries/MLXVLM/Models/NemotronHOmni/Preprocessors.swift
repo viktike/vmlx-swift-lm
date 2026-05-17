@@ -136,9 +136,9 @@ private func rasterizeTile(
     imageSize: Int,
     mean: [Float], std: [Float]
 ) -> MLXArray {
-    // Render to RGBA Float32 bitmap.
-    let bytesPerRow = imageSize * 4 * MemoryLayout<Float>.size
-    var data = Data(count: imageSize * imageSize * 4 * MemoryLayout<Float>.size)
+    // Render to RGB Float32 bitmap (.RGBaf = 3 channels, 32-bit float).
+    let bytesPerRow = imageSize * 3 * MemoryLayout<Float>.size
+    var data = Data(count: imageSize * imageSize * 3 * MemoryLayout<Float>.size)
     data.withUnsafeMutableBytes { ptr in
         imagePreprocessContext.render(
             tile,
@@ -149,9 +149,8 @@ private func rasterizeTile(
             colorSpace: nil)
     }
 
-    // Build (H, W, 4) array, drop alpha → (H, W, 3), normalize, transpose to (3, H, W)
-    var arr = MLXArray(data, [imageSize, imageSize, 4], type: Float32.self)
-    arr = arr[0..., 0..., ..<3] // (H, W, 3)
+    // Build (H, W, 3) array, normalize, transpose to (3, H, W)
+    var arr = MLXArray(data, [imageSize, imageSize, 3], type: Float32.self)
     let meanT = MLXArray(mean).reshaped([1, 1, 3])
     let stdT = MLXArray(std).reshaped([1, 1, 3])
     arr = (arr - meanT) / stdT
