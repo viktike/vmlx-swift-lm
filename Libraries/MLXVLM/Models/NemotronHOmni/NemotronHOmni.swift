@@ -742,8 +742,8 @@ public struct NemotronHOmniProcessor: UserInputProcessor {
             messages: messages, tools: input.tools,
             additionalContext: input.additionalContext)
 
-        let imageTokenId = Self.imageContextTokenId
-        let soundTokenId = Self.soundContextTokenId
+        let imageTokenId = tokenizer.convertTokenToId("<image>") ?? Self.imageContextTokenId
+        let soundTokenId = tokenizer.convertTokenToId("<so_embedding>") ?? Self.soundContextTokenId
 
         if !media.isEmpty {
             let bosTokenId = tokenizer.bosToken.flatMap { tokenizer.convertTokenToId($0) }
