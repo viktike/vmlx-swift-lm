@@ -213,11 +213,23 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
         // Build embeddings for tokens + splice multimodal at placeholder tokens.
         let textEmbeds = languageModel.embedTokens(input.text.tokens)
         var spliced = textEmbeds
+        
+        // Extract placeholder token IDs from the input. The processor set these
+        // based on actual tokenizer output, ensuring consistency.
+        guard let mediaTokenIds = input.mediaTokenIds, mediaTokenIds.count >= 2 else {
+            // No media tokens declared; skip multimodal splice
+            let logits = languageModel.callAsFunction(
+                inputsEmbeds: spliced, cache: convertedCache)
+            return .logits(LMOutput(logits: logits))
+        }
+        let imageTokenId = mediaTokenIds[0]
+        let soundTokenId = mediaTokenIds[1]
+        
         // Image and video share the same `<image>` placeholder per Python
         // model.py (img_context_token_id is reused for both — the
         // distinguishing factor is which tower produced the embedding).
         // The processor emits placeholders in image-first-then-video order
-        // and `mask == imageContextTokenId` matches BOTH groups in one
+        // and `mask == imageTokenId` matches BOTH groups in one
         // sweep — so splicing image and video separately would either
         // (a) trip the placeholder-count precondition (mask matches
         // image+video tokens but replacement only has image rows), or
@@ -239,7 +251,7 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
                 tokens: input.text.tokens,
                 inputsEmbeds: spliced,
                 replacement: visualEmbeds,
-                tokenId: config.imageContextTokenId)
+                tokenId: imageTokenId)
         }
         if let audio = input.audio {
             // Use the pre-encoded embedding when the processor already
@@ -252,7 +264,7 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
                 tokens: input.text.tokens,
                 inputsEmbeds: spliced,
                 replacement: audioEmbeds,
-                tokenId: config.soundContextTokenId)
+                tokenId: soundTokenId)
         }
 
         let logits = languageModel.callAsFunction(
